@@ -11,12 +11,23 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { execSync } = require('node:child_process');
 
-const src = path.join(path.dirname(process.execPath), 'node_modules', 'npm');
+const candidates = [
+  path.join(path.dirname(process.execPath), 'node_modules', 'npm'),
+  path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm'),
+];
+
+try {
+  const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+  if (globalRoot) candidates.push(path.join(globalRoot, 'npm'));
+} catch {}
+
+const src = candidates.find((c) => fs.existsSync(path.join(c, 'bin', 'npm-cli.js')));
 const dest = path.resolve(__dirname, '..', 'vendor', 'npm');
 
-if (!fs.existsSync(path.join(src, 'bin', 'npm-cli.js'))) {
-  console.error('找不到随 Node 分发的 npm：' + src);
+if (!src) {
+  console.error('找不到随 Node 分发的 npm，已尝试候选路径：\n' + candidates.join('\n'));
   process.exit(1);
 }
 
