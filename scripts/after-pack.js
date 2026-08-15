@@ -36,6 +36,14 @@ module.exports = async function afterPack(context) {
     console.log('afterPack: bundled plugins copied verbatim');
   }
 
+  const skillsSrc = path.resolve(__dirname, '..', 'assets', 'skills');
+  const skillsDest = path.join(appOutDir, 'resources', 'app', 'assets', 'skills');
+  if (fs.existsSync(skillsSrc)) {
+    fs.rmSync(skillsDest, { recursive: true, force: true });
+    fs.cpSync(skillsSrc, skillsDest, { recursive: true });
+    console.log('afterPack: bundled skills copied verbatim');
+  }
+
   trimLongPathFiles(appOutDir);
   dedupeNestedModules(appOutDir);
   patchExeIconDirectly(appOutDir);
