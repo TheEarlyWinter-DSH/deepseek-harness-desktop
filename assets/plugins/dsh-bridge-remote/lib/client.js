@@ -273,12 +273,24 @@ window.__ModuleLoader__.load({
       document.body.appendChild(btn);
     }
 
-    if (document.body) {
-      ensureFloatingTrigger();
-    } else {
-      document.addEventListener("DOMContentLoaded", ensureFloatingTrigger);
+    function apply(ctx) {
+      if (document.body) {
+        ensureFloatingTrigger();
+      } else {
+        document.addEventListener("DOMContentLoaded", ensureFloatingTrigger);
+      }
+      if (ctx && typeof ctx.effect === "function") {
+        ctx.effect(() => {
+          return () => {
+            const btn = document.getElementById("dsh-bridge-trigger");
+            if (btn) btn.remove();
+          };
+        });
+      }
     }
 
+    exports.apply = apply;
     exports.openBridgeModal = openBridgeModal;
+    return module.exports;
   }
 });

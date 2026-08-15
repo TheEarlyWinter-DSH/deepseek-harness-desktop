@@ -19,11 +19,15 @@ window.__ModuleLoader__.load({
       } catch {}
     }
 
-    if (typeof window !== "undefined") {
-      fetchSkills();
-      window.dshGetSkills = () => activeSkills;
+    function apply(ctx) {
+      if (typeof window !== "undefined") {
+        fetchSkills();
+        window.dshGetSkills = () => activeSkills;
+      }
     }
 
+    exports.apply = apply;
     exports.getSkills = () => activeSkills;
+    return module.exports;
   }
 });

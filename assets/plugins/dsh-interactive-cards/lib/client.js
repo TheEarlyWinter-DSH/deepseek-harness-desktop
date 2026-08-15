@@ -404,16 +404,28 @@ window.__ModuleLoader__.load({
       }
     });
 
-    if (document.body) {
-      observer.observe(document.body, { childList: true, subtree: true });
-      scheduleScan();
-    } else {
-      document.addEventListener("DOMContentLoaded", () => {
+    function apply(ctx) {
+      if (document.body) {
         observer.observe(document.body, { childList: true, subtree: true });
         scheduleScan();
-      });
+      } else {
+        document.addEventListener("DOMContentLoaded", () => {
+          observer.observe(document.body, { childList: true, subtree: true });
+          scheduleScan();
+        });
+      }
+      if (ctx && typeof ctx.effect === "function") {
+        ctx.effect(() => {
+          return () => {
+            observer.disconnect();
+            if (scanTimer) clearTimeout(scanTimer);
+          };
+        });
+      }
     }
 
+    exports.apply = apply;
     exports.scanAndMountCards = scanAndMountCards;
+    return module.exports;
   }
 });
