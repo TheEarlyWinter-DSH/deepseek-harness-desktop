@@ -914,7 +914,6 @@ const COMPANION_PLUGINS = [
   { id: 'mobile-fix', name: 'dsh-web-mobile-fix', dir: 'dsh-web-mobile-fix' },
   { id: 'interactive-cards', name: '@deepseek-ai/dsh-interactive-cards', dir: 'dsh-interactive-cards' },
   { id: 'skill-loader', name: '@deepseek-ai/dsh-skill-loader', dir: 'dsh-skill-loader' },
-  { id: 'artifacts', name: '@deepseek-ai/dsh-artifacts', dir: 'dsh-artifacts' },
 ];
 
 // 皮肤包目录：assets/skins/<id>/。每个皮肤是一个完整的 dsh client 插件包
@@ -1178,15 +1177,15 @@ function syncCompanionPlugins() {
     let patch = '';
     try { patch = fs.readFileSync(patchFile, 'utf8'); } catch { patch = ''; }
     let changed = false;
-    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory / bridge-remote）
-    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory', 'bridge-remote'];
+    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory / bridge-remote / artifacts）
+    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory', 'bridge-remote', 'artifacts'];
     const purged = removePluginRows(patch, removedPluginIds);
     if (purged.removed.length) {
       patch = purged.patch;
       changed = true;
       log('boot', '已从 profile patch 移除已剔除插件: ' + purged.removed.join(', '));
     }
-    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory', '@deepseek-ai/dsh-bridge-remote'];
+    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory', '@deepseek-ai/dsh-bridge-remote', '@deepseek-ai/dsh-artifacts'];
     for (const rdir of removedDirs) {
       const p = path.join(profileDirP, 'node_modules', ...rdir.split('/'));
       if (fs.existsSync(p)) {
