@@ -1,3 +1,3 @@
-name: Anchored Standard (experimental)
-description: Bootstrap with the Minimal preset's real tool pair (persistent bash + str_replace_editor) and no auto-injected workspace or skill context, then expose the full Standard catalog after the first durable tool call or reply.
+name: 锚定标准模式（实验性）
+description: 首轮调用锚定极简工具对（持久 bash + 文件编辑），不自动注入冗余工作区/技能上下文；首轮工具调用或回复后开放完整标准工具目录。
 order: 5

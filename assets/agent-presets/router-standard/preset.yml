@@ -1,2 +1,2 @@
-name: Router Standard (experimental)
-description: Task-aware routing — spec (plan-first) for fixes, react (doer) for builds; full Standard tools after the first tool call.
+name: 动态路由模式（实验性）
+description: 任务感知智能路由——修 Bug/重构时规划先行（Spec 模式），新建/构建时即刻执行（React 模式）；首次工具调用后开放完整标准工具集。

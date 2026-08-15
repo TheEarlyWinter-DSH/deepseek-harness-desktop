@@ -35,6 +35,15 @@ function syncBundledPresets(assetsRoot, presetsRoot, log = () => {}) {
     const dest = path.join(presetsRoot, entry.name);
     if (fs.existsSync(dest)) {
       kept.push(entry.name);
+      try {
+        const srcYml = fs.readFileSync(path.join(src, 'preset.yml'), 'utf8');
+        const destYmlPath = path.join(dest, 'preset.yml');
+        const destYml = fs.existsSync(destYmlPath) ? fs.readFileSync(destYmlPath, 'utf8') : '';
+        if (srcYml !== destYml) {
+          fs.writeFileSync(destYmlPath, srcYml, 'utf8');
+          log('updated bundled agent preset manifest: ' + entry.name);
+        }
+      } catch {}
       continue;
     }
     try {
