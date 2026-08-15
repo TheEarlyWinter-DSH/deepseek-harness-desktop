@@ -22,6 +22,7 @@ files:
   - profile-module-heal.js
   - patch-row-heal.js
   - preset-sync.js
+  - skill-sync.js
   - preload.js
   - assets/**/*
   - package.json

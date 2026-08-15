@@ -1,0 +1,3 @@
+- insert:
+    - id: interactive-cards
+      name: '@deepseek-ai/dsh-interactive-cards'

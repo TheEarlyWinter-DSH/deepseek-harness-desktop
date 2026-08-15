@@ -25,6 +25,7 @@ const updater = require('./updater');
 const { healProfileModuleShadowing, healCustomModelReasoning } = require('./profile-module-heal');
 const { configLinesFor, removeBundledRowDuplicates, removePluginRows } = require('./patch-row-heal');
 const { syncBundledPresets, ensureDefaultAgentPreset } = require('./preset-sync');
+const { syncBundledSkills } = require('./skill-sync');
 const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
 const zlib = require('node:zlib');
 
@@ -600,6 +601,35 @@ async function runUpdateFlow(manual) {
 
 const lastNotifyAt = new Map(); // sessionId -> timestamp (rate-limit)
 
+async function triggerBridgePush(title, body) {
+  try {
+    const cfgFile = path.join(dshHome || path.join(os.homedir(), '.dsh'), 'bridge-config.json');
+    if (!fs.existsSync(cfgFile)) return;
+    const cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+    if (!cfg.enabled) return;
+
+    if (cfg.barkUrl && cfg.barkUrl.trim().length > 0) {
+      const base = cfg.barkUrl.trim().replace(/\/+$/, '');
+      const url = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(body)}?group=DSH`;
+      fetch(url).catch(() => {});
+    }
+    if (cfg.feishuWebhook && cfg.feishuWebhook.trim().length > 0) {
+      fetch(cfg.feishuWebhook.trim(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ msg_type: 'text', content: { text: `【${title}】\n${body}` } })
+      }).catch(() => {});
+    }
+    if (cfg.customWebhook && cfg.customWebhook.trim().length > 0) {
+      fetch(cfg.customWebhook.trim(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, body, timestamp: Date.now() })
+      }).catch(() => {});
+    }
+  } catch {}
+}
+
 function onSessionTurnEnd(info) {
   if (!notifyOnTurnEnd || quitting) return;
   const now = Date.now();
@@ -607,10 +637,17 @@ function onSessionTurnEnd(info) {
   if (now - last < 30000) return; // same session: at most one toast per 30s
   lastNotifyAt.set(info.sessionId, now);
   log('notify', '任务完成: ' + JSON.stringify(info));
+
+  const title = info.title || 'DSH 任务完成';
+  const body = info.body || '会话任务已完成';
+
+  // 跨端手机推送
+  triggerBridgePush(title, body);
+
   try {
     const n = new Notification({
-      title: info.title || 'DSH 任务完成',
-      body: info.body || '会话任务已完成',
+      title,
+      body,
       icon: path.join(__dirname, 'assets', 'icon.png'),
     });
     n.on('click', () => {
@@ -907,6 +944,10 @@ const COMPANION_PLUGINS = [
   { id: 'dsh-market-plugin', name: '@sanqi-normal/dsh-webui-market-plugin', dir: 'dsh-webui-market' },
   { id: 'skin-switch', name: '@deepseek-ai/dsh-skin-switch' },
   { id: 'mobile-fix', name: 'dsh-web-mobile-fix', dir: 'dsh-web-mobile-fix' },
+  { id: 'interactive-cards', name: '@deepseek-ai/dsh-interactive-cards', dir: 'dsh-interactive-cards' },
+  { id: 'skill-loader', name: '@deepseek-ai/dsh-skill-loader', dir: 'dsh-skill-loader' },
+  { id: 'artifacts', name: '@deepseek-ai/dsh-artifacts', dir: 'dsh-artifacts' },
+  { id: 'bridge-remote', name: '@deepseek-ai/dsh-bridge-remote', dir: 'dsh-bridge-remote' },
 ];
 
 // 皮肤包目录：assets/skins/<id>/。每个皮肤是一个完整的 dsh client 插件包
@@ -1121,6 +1162,14 @@ function syncCompanionPlugins() {
   try {
     const home = dshHome || path.join(os.homedir(), '.dsh');
     const profileDirP = path.join(home, 'profiles', 'web');
+    // 内置 skill 同步（assets/skills/ → ~/.dsh/skills/）
+    const skillsSynced = syncBundledSkills(
+      path.join(__dirname, 'assets', 'skills'),
+      path.join(home, 'skills'),
+      (m) => log('boot', m)
+    );
+    if (skillsSynced.installed.length) log('boot', '已安装内置 skills: ' + skillsSynced.installed.join(', '));
+
     // 内置社区 agent preset（anchored-standard：首请求锚定 Minimal 工具对，
     // 首次工具调用/回复后开放完整 Standard 目录）：安装到用户 preset 根。
     // preset 不进插件树，坏 preset 不会拖垮启动；已存在则跳过（用户手装

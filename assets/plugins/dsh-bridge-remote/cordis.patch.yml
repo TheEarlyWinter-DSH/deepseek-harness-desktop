@@ -1,0 +1,3 @@
+- insert:
+    - id: bridge-remote
+      name: '@deepseek-ai/dsh-bridge-remote'
