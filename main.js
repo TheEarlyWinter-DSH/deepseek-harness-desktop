@@ -1,0 +1,1507 @@
+﻿'use strict';
+
+// DSH Desktop — Electron shell around the DeepSeek Harness browser UI.
+//
+// What it does:
+//   1. Boots the bundled dsh CLI ("dsh web") with a standalone Node runtime.
+//   2. Waits until the web UI answers HTTP on 127.0.0.1:<free-port>.
+//   3. Shows it in a native window; quits the server when the app exits.
+//   4. Checks for official @deepseek-ai/dsh releases and, with the user's
+//      consent, self-updates the agent (see updater.js).
+//
+// The dsh CLI is spawned with the bundled node.exe (vendor/node/node.exe in
+// dev, resources/node/node.exe when packaged) so that prebuilt native
+// modules (sharp, node-pty, koffi, ...) match the Node ABI they were
+// installed for. We deliberately never rebuild them against Electron.
+
+const { app, BrowserWindow, Menu, Tray, shell, dialog, Notification, ipcMain, clipboard, nativeImage } = require('electron');
+const { spawn } = require('node:child_process');
+const path = require('node:path');
+const fs = require('node:fs');
+const http = require('node:http');
+const os = require('node:os');
+
+const updater = require('./updater');
+const balance = require('./balance');
+const { healProfileModuleShadowing } = require('./profile-module-heal');
+const { configLinesFor, removeBundledRowDuplicates, removePluginRows } = require('./patch-row-heal');
+const { syncBundledPresets, ensureDefaultAgentPreset } = require('./preset-sync');
+const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
+const zlib = require('node:zlib');
+
+// ---------------------------------------------------------------------------
+// H2/H3 路径围栏：文件还原/打开只允许「会话 cwd」之下的项目文件。
+// 任意绝对路径（如写入 Startup\*.bat）一律拒绝；缓存 5 分钟。
+// ---------------------------------------------------------------------------
+const DANGEROUS_EXT = /\.(bat|cmd|com|exe|ps1|vbs|lnk|js|jse|msi|scr|pif|reg)$/i;
+const fileRootsCache = { at: 0, roots: [] };
+
+function fileRoots() {
+  if (Date.now() - fileRootsCache.at < 5 * 60 * 1000) return fileRootsCache.roots;
+  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const roots = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { walk(p); continue; }
+      if (e.name !== 'session.jsonl.zstd') continue;
+      try {
+        const buf = fs.readFileSync(p);
+        const { frames } = scanZstdFrames(buf);
+        if (frames.length === 0) continue;
+        const text = zlib.zstdDecompressSync(buf.subarray(frames[0].start, frames[0].end)).toString('utf8');
+        const header = JSON.parse(text.split('\n', 1)[0]);
+        if (header && typeof header.cwd === 'string' && header.cwd) roots.push(header.cwd);
+      } catch { /* 跳过损坏日志 */ }
+    }
+  };
+  walk(path.join(dshHome, 'sessions'));
+  fileRootsCache.roots = [...new Set(roots)];
+  fileRootsCache.at = Date.now();
+  return fileRootsCache.roots;
+}
+
+function isUnderFileRoots(p) {
+  const resolved = path.resolve(p);
+  return fileRoots().some((r) => {
+    const rp = path.resolve(r);
+    return resolved === rp || resolved.startsWith(rp + path.sep);
+  });
+}
+
+const IS_WIN = process.platform === 'win32';
+const APP_VERSION = app.getVersion();
+const AUTO_UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6 hours
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let mainWindow = null;
+let serverProc = null;
+let webUrl = null;
+let quitting = false;
+let updateBusy = false;
+let notifyOnTurnEnd = true;
+let sessionWatcher = null;
+let userDataDir = '';
+let logsDir = '';
+let dshHome = '';
+let desktopLog = null;
+let tray = null;
+let forceQuit = false;
+let balanceCache = null;
+let balanceTimer = null;
+let restartingServer = false;
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function log(tag, msg) {
+  // 本地时间 + 显式时区偏移：此前用 toISOString()（UTC），本地排查时易误判（issue #4）。
+  const d = new Date();
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  const ts = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}` +
+    ` UTC${sign}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`;
+  const line = `[${ts}] [${tag}] ${msg}\n`;
+  try { if (desktopLog) desktopLog.write(line); } catch {}
+  if (process.env.DSH_DESKTOP_DEBUG) process.stdout.write(line);
+}
+
+function nodeExe() {
+  if (app.isPackaged) return path.join(process.resourcesPath, 'node', 'node.exe');
+  return path.resolve(__dirname, 'vendor', 'node', 'node.exe');
+}
+
+function npmCli() {
+  if (app.isPackaged) return path.join(process.resourcesPath, 'npm', 'bin', 'npm-cli.js');
+  return path.resolve(__dirname, 'vendor', 'npm', 'bin', 'npm-cli.js');
+}
+
+// Context shared with the updater module.
+function updCtx() {
+  return { userDataDir, nodeExe, npmCli, log };
+}
+
+// Updated overlay (user-approved official release) takes precedence over the
+// bundled copy; the bundled copy is the fallback.
+function dshBin() {
+  const ov = updater.overlayBinPath(updCtx());
+  if (ov && fs.existsSync(ov)) return ov;
+  return require.resolve('@deepseek-ai/dsh/lib/bin.js');
+}
+
+function dshVersion() { return updater.activeVersion(updCtx()) || '未知'; }
+
+function dshVersionSource() {
+  return updater.overlayVersion(updCtx()) ? '用户目录（已更新）' : '内置';
+}
+
+function killTree(proc) {
+  if (!proc || !proc.pid) return;
+  try {
+    if (IS_WIN) {
+      // M2 修复：先优雅（无 /F）给进程收尾机会（避免撕裂 session.jsonl.zstd），
+      // 短等待后仍存活再强杀。
+      spawn('taskkill', ['/pid', String(proc.pid), '/T'], { windowsHide: true, stdio: 'ignore' });
+      const pid = proc.pid;
+      setTimeout(() => {
+        try {
+          const query = 'tasklist /FI "PID eq ' + pid + '" /FO CSV /NH';
+          const alive = require('node:child_process').execSync(query, { encoding: 'utf8', windowsHide: true });
+          if (alive.includes(String(pid))) {
+            spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+          }
+        } catch { /* 进程已退出或查询失败 */ }
+      }, 1500);
+    } else {
+      try { process.kill(-proc.pid, 'SIGTERM'); } catch { proc.kill('SIGTERM'); }
+    }
+  } catch (err) {
+    log('killTree', String(err));
+  }
+}
+
+// Environment for the dsh child: drop harness/session leftovers so the
+// desktop instance boots clean, keep everything else (proxy, API keys, ...).
+function childEnv() {
+  const env = { ...process.env };
+  for (const k of ['DSH_WEB_URL', 'DSH_SESSION_ID', 'DSH_SESSION_JSONL', 'DSH_SHELL', 'ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS']) {
+    delete env[k];
+  }
+  if (dshHome) env.DSH_HOME = dshHome;
+  env.NO_COLOR = '1';
+  return env;
+}
+
+// 等待一个子进程真正退出（taskkill 先优雅后强杀，锁住的 DLL 要等进程
+// 终止才释放）。轮询 tasklist，超时后放行由调用方自行处理。
+function waitForProcExit(proc, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!proc || !proc.pid) return resolve();
+    const pid = proc.pid;
+    const started = Date.now();
+    const check = () => {
+      try {
+        const out = require('node:child_process').execSync(
+          'tasklist /FI "PID eq ' + pid + '" /FO CSV /NH', { encoding: 'utf8', windowsHide: true });
+        if (!out.includes('"' + pid + '"')) return resolve();
+      } catch { return resolve(); }
+      if (Date.now() - started >= timeoutMs) {
+        log('service', '等待旧服务进程退出超时（PID ' + pid + '），继续');
+        return resolve();
+      }
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+
+function showBox(opts) {
+  if (mainWindow && !mainWindow.isDestroyed()) return dialog.showMessageBox(mainWindow, opts);
+  return dialog.showMessageBox(opts);
+}
+
+// ---------------------------------------------------------------------------
+// dsh web server lifecycle
+// ---------------------------------------------------------------------------
+
+function startServer() {
+  return new Promise((resolve, reject) => {
+    // M1 修复：重入前先终结旧进程，避免孤儿 harness 同时写同一 DSH_HOME。
+    if (serverProc && !serverProc.killed && !quitting) {
+      log('dsh', 'startServer 重入：先终结旧进程再启动');
+      killTree(serverProc);
+      serverProc = null;
+    }
+    const nodeBin = nodeExe();
+    const bin = dshBin();
+    if (!fs.existsSync(nodeBin)) {
+      return reject(new Error(
+        '找不到内置 Node 运行时: ' + nodeBin + '\n' +
+        (app.isPackaged ? '安装包可能不完整，请重新安装。' : '开发模式请先运行: npm run fetch-node')
+      ));
+    }
+    const out = fs.createWriteStream(path.join(logsDir, 'dsh-web.log'), { flags: 'a' });
+    log('dsh', `启动: "${nodeBin}" "${bin}" web --host 127.0.0.1 --port 0`);
+    const proc = spawn(nodeBin, [bin, 'web', '--host', '127.0.0.1', '--port', '0'], {
+      cwd: userDataDir,
+      env: childEnv(),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    serverProc = proc;
+    let settled = false;
+    let bootTimer = null;
+    const finish = (fn, value) => {
+      if (!settled) { settled = true; fn(value); }
+      if (bootTimer) { clearTimeout(bootTimer); bootTimer = null; }
+    };
+    const onData = (chunk) => {
+      out.write(chunk);
+      const text = chunk.toString();
+      for (const line of text.split(/\r?\n/)) {
+        const m = line.match(/dsh web:\s+(https?:\/\/\S+)/);
+        if (m) finish(resolve, m[1]);
+      }
+    };
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', (c) => out.write(c));
+    proc.on('error', (err) => finish(reject, err));
+    proc.on('exit', (code, signal) => {
+      out.end();
+      log('dsh', `进程退出 code=${code} signal=${signal}`);
+      // 原地重启（插件市场）或已替换为新进程时，不打扰用户、也不清掉新进程的句柄。
+      const intentional = restartingServer || serverProc !== proc;
+      if (serverProc === proc) serverProc = null;
+      finish(reject, new Error(`dsh web 启动失败（退出码 ${code}）。日志: ${path.join(logsDir, 'dsh-web.log')}`));
+      if (!quitting && !intentional && webUrl && mainWindow && !mainWindow.isDestroyed()) {
+        showBox({
+          type: 'error',
+          title: 'DSH 服务已停止',
+          message: 'DeepSeek Harness 服务意外退出。',
+          detail: `日志文件：${path.join(logsDir, 'dsh-web.log')}`,
+          buttons: ['重新启动', '退出'],
+          defaultId: 0,
+          cancelId: 1,
+        }).then(({ response }) => {
+          if (response === 0) startAndShow().catch((err) => handleBootFailure(err));
+          else app.quit();
+        });
+      }
+    });
+    // Safety net in case the URL line never appears.
+    bootTimer = setTimeout(() => finish(reject, new Error('等待 dsh web 启动超时（60 秒）')), 60000);
+    bootTimer.unref();
+  });
+}
+
+function waitUntilUp(url, timeoutMs = 120000) {
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const req = http.get(url + '/', { timeout: 3000 }, (res) => {
+        res.resume();
+        if (res.statusCode && res.statusCode < 500) resolve(url);
+        else retry();
+      });
+      req.on('error', retry);
+      req.on('timeout', () => { req.destroy(); retry(); });
+    };
+    const retry = () => {
+      if (Date.now() - started > timeoutMs) reject(new Error('Web UI 未在预期时间内就绪'));
+      else setTimeout(tick, 300);
+    };
+    tick();
+  });
+}
+
+function startAndShow() {
+  return startServer()
+    .then(waitUntilUp)
+    .then((url) => {
+      webUrl = url;
+      log('boot', 'Web UI 就绪: ' + url);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        return mainWindow.loadURL(url).then(() => url);
+      }
+      return url;
+    });
+}
+
+function handleBootFailure(err) {
+  const ov = updater.overlayBinPath(updCtx());
+  if (ov && fs.existsSync(ov)) {
+    showBox({
+      type: 'error',
+      title: 'DeepSeek Harness 启动失败',
+      message: '更新后的 agent 无法启动。',
+      detail: (err && err.message || String(err)) + '\n\n可回退到内置版本继续使用。',
+      buttons: ['回退到内置版本并重试', '重试', '退出'],
+      defaultId: 0,
+      cancelId: 2,
+    }).then(({ response }) => {
+      if (response === 0) {
+        updater.rollback(updCtx());
+        startAndShow().catch((e2) => fatal('DeepSeek Harness 启动失败', e2));
+      } else if (response === 1) {
+        startAndShow().catch((e2) => handleBootFailure(e2));
+      } else {
+        app.quit();
+      }
+    });
+  } else {
+    fatal('DeepSeek Harness 启动失败', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Window
+// ---------------------------------------------------------------------------
+
+function createWindow() {
+  const icoPath = path.join(__dirname, 'assets', 'icon.ico');
+  const pngPath = path.join(__dirname, 'assets', 'icon.png');
+  const windowIcon = IS_WIN && fs.existsSync(icoPath) ? icoPath : pngPath;
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    minWidth: 960,
+    minHeight: 640,
+    show: false,
+    title: 'DeepSeek Harness',
+    backgroundColor: '#0b1220',
+    icon: windowIcon,
+    // 风格化无边框窗口：去掉原生标题栏/菜单栏，自绘玻璃栏 + Win11 原生圆角。
+    ...(IS_WIN ? { frame: false, roundedCorners: true } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      spellcheck: false,
+    },
+  });
+
+  mainWindow.loadFile(path.join(__dirname, 'assets', 'loading.html'));
+  mainWindow.once('ready-to-show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show();
+  });
+  // 兜底保护：防止 ready-to-show 因 Chromium 合成延迟导致窗口迟迟不显示
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show();
+    }
+  }, 250);
+  // Keep the app brand in the OS title bar (the web UI sets its own <title>).
+  mainWindow.on('page-title-updated', (event) => {
+    event.preventDefault();
+    mainWindow.setTitle('DeepSeek Harness');
+  });
+
+  // Open target=_blank / window.open in the system browser.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+
+  // Keep the window pinned to the local web UI; send external links out.
+  // H1 修复：origin 精确比较（protocol+host+port），杜绝前缀/异域/userinfo 逃逸；
+  // file: 一律拦截（同 webContents 下 file 页面仍持有 preload 桥）；will-redirect 同规则。
+  const isAllowedWebUrl = (url) => {
+    try {
+      const target = new URL(url);
+      if (target.protocol !== 'http:' && target.protocol !== 'https:') return false;
+      if (webUrl) {
+        const base = new URL(webUrl);
+        return target.origin === base.origin;
+      }
+      return target.hostname === '127.0.0.1' || target.hostname === 'localhost' || target.hostname === '::1';
+    } catch {
+      return false;
+    }
+  };
+  const guardNavigation = (event, url) => {
+    if (isAllowedWebUrl(url)) return;
+    event.preventDefault();
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+  };
+  mainWindow.webContents.on('will-navigate', guardNavigation);
+  mainWindow.webContents.on('will-redirect', guardNavigation);
+
+  // 渲染进程错误捕获：插件/页面异常统一落到 desktop.log，便于排查空白视图。
+  mainWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    if (level === 'error' || level === 'warning') {
+      log('page', `[${level}] ${message} (${sourceId || 'unknown'}:${line})`);
+    }
+  });
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    log('page', `渲染进程异常退出: ${details.reason} (exitCode=${details.exitCode})`);
+  });
+
+  // 移除菜单栏后仍保留的键盘快捷键。
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    const key = String(input.key || '').toLowerCase();
+    if (input.key === 'F11') { mainWindow.setFullScreen(!mainWindow.isFullScreen()); event.preventDefault(); }
+    else if (input.key === 'F12') { mainWindow.webContents.toggleDevTools(); event.preventDefault(); }
+    else if (input.control && input.shift && key === 'i') { mainWindow.webContents.toggleDevTools(); event.preventDefault(); }
+    else if (input.control && key === 'r') { mainWindow.reload(); event.preventDefault(); }
+    else if (input.alt && key === 'f4') { mainWindow.close(); event.preventDefault(); }
+  });
+
+  // 自绘最大化/还原按钮需要感知窗口状态。
+  const sendMaxState = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('chrome:maximized', mainWindow.isMaximized());
+    }
+  };
+  mainWindow.on('maximize', sendMaxState);
+  mainWindow.on('unmaximize', sendMaxState);
+  mainWindow.on('enter-full-screen', sendMaxState);
+  mainWindow.on('leave-full-screen', sendMaxState);
+
+  // 关闭 → 隐藏到托盘（可在 chrome 菜单关闭该行为）。
+  mainWindow.on('close', (event) => {
+    if (!forceQuit && IS_WIN && closeToTrayEnabled() && tray) {
+      event.preventDefault();
+      mainWindow.hide();
+      trayHintOnce();
+    }
+  });
+
+  mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+function fatal(title, err) {
+  log('fatal', title + ': ' + ((err && (err.stack || err.message)) || err));
+  const detail = '错误：' + ((err && err.message) || err) + '\n\n日志目录：' + logsDir;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    dialog.showErrorBox(title, detail);
+    app.exit(1);
+    return;
+  }
+  showBox({
+    type: 'error',
+    title,
+    message: title,
+    detail,
+    buttons: ['重试', '退出'],
+    defaultId: 0,
+    cancelId: 1,
+  }).then(({ response }) => {
+    if (response === 0) startAndShow().catch((err2) => handleBootFailure(err2));
+    else app.quit();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Self-update flow (official @deepseek-ai/dsh releases, user-consented)
+// ---------------------------------------------------------------------------
+
+function showUpdateWindow(version, kind = 'agent') {
+  const win = new BrowserWindow({
+    width: 460,
+    height: 300,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+    modal: true,
+    title: '正在更新',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+    webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false },
+  });
+  win.loadFile(path.join(__dirname, 'assets', 'updating.html')).then(() => {
+    win.webContents
+      .executeJavaScript(`window.__init && window.__init(${JSON.stringify({ version, kind })})`)
+      .catch(() => {});
+  });
+  win.once('ready-to-show', () => win.show());
+  return win;
+}
+
+async function runUpdateFlow(manual) {
+  if (quitting) return;
+  if (updateBusy) {
+    if (manual) await showBox({ type: 'info', title: '更新', message: '更新正在进行中，请稍候。', buttons: ['确定'] });
+    return;
+  }
+  const ctx = updCtx();
+  let latest;
+  try {
+    latest = await updater.checkLatest(ctx);
+  } catch (err) {
+    log('update', '检查失败: ' + err.message);
+    if (manual) {
+      await showBox({
+        type: 'warning',
+        title: '检查更新失败',
+        message: '无法连接 npm registry。',
+        detail: err.message + '\n\n可通过环境变量 NPM_CONFIG_REGISTRY 配置镜像。',
+        buttons: ['确定'],
+      });
+    }
+    return;
+  }
+  const current = updater.activeVersion(ctx);
+  const settings = updater.loadSettings(ctx);
+  if (updater.compareVersions(latest, current) <= 0) {
+    if (manual) {
+      await showBox({
+        type: 'info',
+        title: '检查更新',
+        message: '当前已是最新版本。',
+        detail: `@deepseek-ai/dsh@${current}`,
+        buttons: ['确定'],
+      });
+    }
+    return;
+  }
+  if (!manual && settings.skipVersion === latest) return;
+
+  const { response } = await showBox({
+    type: 'info',
+    title: '发现新版本',
+    message: `官方 @deepseek-ai/dsh 发布了新版本：${latest}`,
+    detail: `当前版本：${current}\n\n是否立即更新？\n· 从 npm 官方源下载新版本及其依赖（首次约 250MB）\n· 更新期间界面保持可用，完成后重启应用生效\n· 失败会自动保留当前版本`,
+    buttons: ['立即更新', '跳过此版本', '稍后'],
+    defaultId: 0,
+    cancelId: 2,
+  });
+  if (response === 1) {
+    settings.skipVersion = latest;
+    updater.saveSettings(ctx, settings);
+    log('update', '用户跳过版本 ' + latest);
+    return;
+  }
+  if (response === 2) return;
+
+  updateBusy = true;
+  const progressWin = showUpdateWindow(latest);
+  try {
+    await updater.applyUpdate(ctx, latest);
+    const { response: r2 } = await showBox({
+      type: 'info',
+      title: '更新完成',
+      message: `已更新到 @deepseek-ai/dsh@${latest}`,
+      detail: '重启应用后生效。',
+      buttons: ['立即重启', '稍后重启'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (r2 === 0) {
+      quitting = true;
+      killTree(serverProc);
+      app.relaunch();
+      app.exit(0);
+    }
+  } catch (err) {
+    log('update', '更新失败: ' + err.message);
+    await showBox({
+      type: 'error',
+      title: '更新失败',
+      message: '未能完成更新，仍使用当前版本。',
+      detail: err.message,
+      buttons: ['确定'],
+    });
+  } finally {
+    updateBusy = false;
+    if (progressWin && !progressWin.isDestroyed()) progressWin.destroy();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session-completion notifications
+// ---------------------------------------------------------------------------
+
+const lastNotifyAt = new Map(); // sessionId -> timestamp (rate-limit)
+
+function onSessionTurnEnd(info) {
+  if (!notifyOnTurnEnd || quitting) return;
+  const now = Date.now();
+  const last = lastNotifyAt.get(info.sessionId) || 0;
+  if (now - last < 30000) return; // same session: at most one toast per 30s
+  lastNotifyAt.set(info.sessionId, now);
+  log('notify', '任务完成: ' + JSON.stringify(info));
+  try {
+    const n = new Notification({
+      title: info.title || 'DSH 任务完成',
+      body: info.body || '会话任务已完成',
+      icon: path.join(__dirname, 'assets', 'icon.png'),
+    });
+    n.on('click', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+    n.show();
+  } catch (err) {
+    log('notify', '通知发送失败: ' + err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome（自绘标题栏）IPC、托盘、余额、快捷方式
+// ---------------------------------------------------------------------------
+
+function closeToTrayEnabled() {
+  const s = updater.loadSettings(updCtx());
+  return s.closeToTray !== false;
+}
+
+function setCloseToTray(v) {
+  const s = updater.loadSettings(updCtx());
+  s.closeToTray = !!v;
+  updater.saveSettings(updCtx(), s);
+}
+
+function repoUrls() {
+  return {
+    github: 'https://github.com/deepseek-ai/deepseek-harness',
+    gitee: '',
+  };
+}
+
+async function showAbout() {
+  await showBox({
+    type: 'info',
+    title: '关于 DeepSeek Harness',
+    message: 'DeepSeek Harness（版本 ' + APP_VERSION + '）',
+    detail: 'DeepSeek Harness 专属桌面客户端\n\n官方内核版本：' + dshVersion() + '（' + dshVersionSource() + '）\n数据目录：' + userDataDir + '\nDSH_HOME：' + (dshHome || '（dsh 默认）'),
+    buttons: ['确定'],
+  });
+}
+
+function registerChromeIpc() {
+  ipcMain.handle('chrome:init', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return null;
+    let iconDataUri = '';
+    try {
+      const buf = fs.readFileSync(path.join(__dirname, 'assets', 'icon.png'));
+      if (buf.length > 0 && buf[0] === 0x89 && buf[1] === 0x50) {
+        iconDataUri = 'data:image/png;base64,' + buf.toString('base64');
+      }
+    } catch {}
+    const s = updater.loadSettings(updCtx());
+    const urls = repoUrls();
+    return {
+      appVersion: APP_VERSION,
+      agentVersion: dshVersion(),
+      agentSource: dshVersionSource(),
+      notifyOnTurnEnd,
+      closeToTray: s.closeToTray !== false,
+      iconDataUri,
+      repoUrls: urls,
+      staticPort: previewStaticPort,
+    };
+  });
+
+  ipcMain.handle('chrome:window', (event, { action } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return null;
+    switch (action) {
+      case 'minimize': mainWindow.minimize(); break;
+      case 'toggle-maximize': mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize(); break;
+      case 'close': mainWindow.close(); break;
+      case 'is-maximized': return mainWindow.isMaximized();
+    }
+    return null;
+  });
+
+  ipcMain.handle('chrome:menu', async (event, { action } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) {
+      return { notifyOnTurnEnd, closeToTray: closeToTrayEnabled() };
+    }
+    switch (action) {
+      case 'reload': mainWindow.reload(); break;
+      case 'devtools': mainWindow.webContents.toggleDevTools(); break;
+      case 'fullscreen': mainWindow.setFullScreen(!mainWindow.isFullScreen()); break;
+      case 'open-browser': if (webUrl) shell.openExternal(webUrl); break;
+      case 'open-logs': shell.openPath(logsDir); break;
+      case 'check-agent-update': runUpdateFlow(true); break;
+      case 'toggle-notify': {
+        notifyOnTurnEnd = !notifyOnTurnEnd;
+        const s = updater.loadSettings(updCtx());
+        s.notifyOnTurnEnd = notifyOnTurnEnd;
+        updater.saveSettings(updCtx(), s);
+        break;
+      }
+      case 'toggle-close-to-tray': setCloseToTray(!closeToTrayEnabled()); break;
+      case 'about': showAbout(); break;
+      case 'quit': forceQuit = true; app.quit(); break;
+    }
+    return { notifyOnTurnEnd, closeToTray: closeToTrayEnabled() };
+  });
+
+  // 插件市场：原地重启 dsh web 服务（安装/卸载插件后生效，窗口重载到新端口）。
+  ipcMain.handle('chrome:restart-service', async (event, payload = {}) => {
+    if (payload?.intent !== 'restart-service') return { ok: false, error: 'missing-intent' };
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'unauthorized' };
+    if (!serverProc || restartingServer) return { ok: false, error: 'not-running' };
+    log('service', '请求重启 dsh web 服务');
+    restartingServer = true;
+    try {
+      const oldProc = serverProc;
+      killTree(serverProc);
+      serverProc = null;
+      // 等旧进程真正退出（DLL 文件锁随之释放），再执行插件市场排队任务，
+      // 最后才拉起新服务 —— 排队安装正需要这个"无锁窗口"。
+      await waitForProcExit(oldProc, 20000);
+      await processPendingMarketOps();
+      // pnpm（排队安装/卸载）会重写 profile node_modules：可能删掉配套插件
+      // 副本、重新 hoist 核心包。服务拉起前重建 + 清理，顺序不能反。
+      syncCompanionPlugins();
+      healProfileModules();
+      const url = await startAndShow();
+      log('service', 'dsh web 服务已重启: ' + url);
+      return { ok: true, url };
+    } catch (err) {
+      log('service', '重启失败: ' + ((err && err.message) || err));
+      return { ok: false, error: String((err && err.message) || err) };
+    } finally {
+      restartingServer = false;
+    }
+  });
+
+  // 复制文本到剪贴板（菜单「更新源」复制按钮 / 关于对话框）。
+  ipcMain.handle('dsh:copy-text', (event, { text } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false };
+    if (typeof text !== 'string' || !text || text.length > 2048) return { ok: false };
+    clipboard.writeText(text);
+    return { ok: true };
+  });
+
+  // preload 转发的页面异常（window.onerror / unhandledrejection）。
+  ipcMain.on('dsh:page-error', (event, payload) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    log('page-error', String(payload));
+  });
+
+  ipcMain.handle('dsh:balance-refresh', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return balanceCache;
+    return refreshBalance();
+  });
+
+  // 文件还原（「文件」视图的回退）：按会话日志里已持久化的写前/写后全文，
+  // 做精确内容匹配后替换 —— 只有内容一致才动手，天然幂等且安全。
+  ipcMain.handle('dsh:file-revert', async (event, { changes } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { results: [] };
+    if (!Array.isArray(changes) || changes.length === 0 || changes.length > 300) return { results: [] };
+    const results = [];
+    for (const c of changes) {
+      const p = String((c && c.path) || '');
+      const oldText = String((c && c.oldText) ?? '');
+      const newText = String((c && c.newText) ?? '');
+      if (!path.isAbsolute(p) || oldText.length > 400000 || newText.length > 400000) {
+        results.push({ path: p, status: 'invalid' });
+        continue;
+      }
+      if (!isUnderFileRoots(p)) {
+        results.push({ path: p, status: 'forbidden' });
+        continue;
+      }
+      try {
+        const exists = fs.existsSync(p);
+        const content = exists ? fs.readFileSync(p, 'utf8') : null;
+        if (oldText === '' && newText !== '') {
+          // 新建 → 删除（内容必须仍是 agent 写入的原文）
+          if (content !== null && content === newText) { fs.rmSync(p); results.push({ path: p, status: 'reverted' }); }
+          else results.push({ path: p, status: content === null ? 'missing' : 'conflict' });
+        } else if (newText === '' && oldText !== '') {
+          // 删除 → 恢复（文件必须仍不存在）
+          if (content === null) { fs.writeFileSync(p, oldText, 'utf8'); results.push({ path: p, status: 'reverted' }); }
+          else results.push({ path: p, status: 'conflict' });
+        } else {
+          if (content !== null && content.includes(newText)) {
+            fs.writeFileSync(p, content.replace(newText, oldText), 'utf8');
+            results.push({ path: p, status: 'reverted' });
+          } else if (content !== null && content === oldText) {
+            results.push({ path: p, status: 'skipped' });
+          } else {
+            results.push({ path: p, status: content === null ? 'missing' : 'conflict' });
+          }
+        }
+      } catch (err) {
+        results.push({ path: p, status: 'failed', error: String((err && err.message) || err) });
+      }
+    }
+    log('file-revert', JSON.stringify(results.slice(0, 20)));
+    return { results };
+  });
+
+  // 「全部文件」视图的打开请求：用系统默认程序打开项目文件。
+  ipcMain.handle('dsh:file-open', async (event, { path: p } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    if (typeof p !== 'string' || !path.isAbsolute(p)) return { ok: false, error: 'path must be absolute' };
+    if (!isUnderFileRoots(p)) return { ok: false, error: 'path outside session workspace' };
+    if (DANGEROUS_EXT.test(p)) return { ok: false, error: 'executable files are not openable from the file view' };
+    try {
+      if (!fs.existsSync(p)) return { ok: false, error: 'file not found' };
+      const msg = await shell.openPath(p);
+      if (msg) return { ok: false, error: msg };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  // 预览面板：用系统浏览器打开 http(s) URL。
+  ipcMain.handle('dsh:open-external', async (event, { url } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return { ok: false, error: 'invalid url' };
+    try {
+      await shell.openExternal(url);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+}
+
+let trayHintShown = false;
+function trayHintOnce() {
+  if (trayHintShown || !tray) return;
+  trayHintShown = true;
+  try {
+    tray.displayBalloon({
+      title: 'DeepSeek Harness 仍在运行',
+      content: '窗口已隐藏到系统托盘，点击托盘图标可重新打开。',
+      iconType: 'info',
+    });
+  } catch {}
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray() {
+  if (!IS_WIN) return;
+  try {
+    const iconPath = path.join(__dirname, 'assets', 'tray-icon.png');
+    if (!fs.existsSync(iconPath)) return;
+    tray = new Tray(iconPath);
+    tray.setToolTip('DeepSeek Harness');
+    const menu = Menu.buildFromTemplate([
+      { label: '显示 DeepSeek Harness', click: () => showMainWindow() },
+      { type: 'separator' },
+      { label: '检查内核 dsh 更新…', click: () => { showMainWindow(); runUpdateFlow(true); } },
+      {
+        label: '会话完成通知',
+        type: 'checkbox',
+        checked: notifyOnTurnEnd,
+        click: (item) => {
+          notifyOnTurnEnd = item.checked;
+          const s = updater.loadSettings(updCtx());
+          s.notifyOnTurnEnd = item.checked;
+          updater.saveSettings(updCtx(), s);
+        },
+      },
+      { type: 'separator' },
+      { label: '退出', click: () => { forceQuit = true; app.quit(); } },
+    ]);
+    tray.setContextMenu(menu);
+    tray.on('click', () => {
+      if (mainWindow && mainWindow.isVisible()) mainWindow.hide();
+      else showMainWindow();
+    });
+    tray.on('double-click', () => showMainWindow());
+    log('boot', '系统托盘已就绪');
+  } catch (err) {
+    log('boot', '创建系统托盘失败: ' + err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek 余额（推送到 Web UI 的 dsh-balance 插件）
+// ---------------------------------------------------------------------------
+
+async function refreshBalance() {
+  const home = dshHome || path.join(os.homedir(), '.dsh');
+  let result;
+  try {
+    result = await balance.queryBalance(home);
+  } catch (err) {
+    result = { ok: false, error: String((err && err.message) || err), balances: [] };
+  }
+  // 按当前默认模型选择价格档（settings.json 可覆盖 balancePrices.<model>）。
+  const model = balance.readActiveModel(home) || 'deepseek-v4-pro';
+  const table = result.prices || balance.DEFAULT_PRICES;
+  const s = updater.loadSettings(updCtx());
+  const override = s.balancePrices && s.balancePrices[model];
+  result.prices = { ...(table[model] || balance.FALLBACK_PRICES), ...(override || {}) };
+  balanceCache = result;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('dsh:balance', result);
+  }
+  return result;
+}
+
+function startBalanceLoop() {
+  refreshBalance().catch(() => {});
+  balanceTimer = setInterval(() => refreshBalance().catch(() => {}), 15 * 60 * 1000);
+  if (balanceTimer.unref) balanceTimer.unref();
+}
+
+// ---------------------------------------------------------------------------
+// 配套 dsh 插件同步（注入 web profile：余额小部件 + 文件更改追踪/还原 + 皮肤）
+// ---------------------------------------------------------------------------
+
+const COMPANION_PLUGINS = [
+  { id: 'balance', name: '@deepseek-ai/dsh-balance' },
+  { id: 'file-changes', name: '@deepseek-ai/dsh-file-changes' },
+  { id: 'client-file-changes', name: '@deepseek-ai/dsh-client-file-changes' },
+  { id: 'terminal', name: '@deepseek-ai/dsh-terminal' },
+  // 社区插件市场（awesome-dsh-plugin.com 目录）：内置分发，替换早期 npm 检索版市场。
+  { id: 'dsh-market-plugin', name: '@sanqi-normal/dsh-webui-market-plugin', dir: 'dsh-webui-market' },
+  { id: 'skin-switch', name: '@deepseek-ai/dsh-skin-switch' },
+  { id: 'mobile-fix', name: 'dsh-web-mobile-fix', dir: 'dsh-web-mobile-fix' },
+];
+
+// 皮肤包目录：assets/skins/<id>/。每个皮肤是一个完整的 dsh client 插件包
+// （package.json + lib/ + skin.json + LICENSE/NOTICE），随桌面端分发；
+// 默认全部以 disabled: true 注册（不启用任何皮肤），由「设置 → 皮肤」切换。
+const SKINS_DIR = path.join(__dirname, 'assets', 'skins');
+
+function readJsonFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+// 拷贝一个插件包目录到 profile node_modules（按包名 scope 落位，幂等）。
+// 除运行必需文件外，LICENSE/NOTICE/README 等许可与出处文件以及 preview/
+// 目录（皮肤预览图）一并随包分发。
+function copyPluginPackage(profileDirP, src, name) {
+  const destRoot = path.join(profileDirP, 'node_modules', ...name.split('/'));
+  fs.mkdirSync(path.dirname(destRoot), { recursive: true });
+  const copyFile = (rel) => {
+    const sf = path.join(src, rel);
+    if (!fs.existsSync(sf) || fs.statSync(sf).isDirectory()) return;
+    const df = path.join(destRoot, rel);
+    fs.mkdirSync(path.dirname(df), { recursive: true });
+    fs.copyFileSync(sf, df);
+  };
+  const copyDir = (rel) => {
+    const sd = path.join(src, rel);
+    if (!fs.existsSync(sd) || !fs.statSync(sd).isDirectory()) return;
+    for (const entry of fs.readdirSync(sd, { withFileTypes: true })) {
+      const sub = rel + '/' + entry.name;
+      if (entry.isDirectory()) copyDir(sub);
+      else copyFile(sub);
+    }
+  };
+  // lib 整目录随包（配套插件可能有 logic.js 等额外模块，按清单拷会漏文件
+  // 导致 dsh web 启动时 ERR_MODULE_NOT_FOUND）。
+  for (const f of ['package.json', 'skin.json', ...EXTRA_PACKAGE_FILES]) copyFile(f);
+  // 社区插件（soul-md / tdai-memory / tool-vision）入口在包根目录而非
+  // lib/，vendor/ 是其内置依赖，同样必须随包分发。
+  for (const f of ['index.js', 'client.js', 'recall-inject.js', 'cordis.patch.yml']) copyFile(f);
+  copyDir('lib');
+  copyDir('preview');
+  copyDir('vendor');
+  // 内置插件自带的嵌套 node_modules（vendored 运行时依赖）：放在包内部，
+  // pnpm 重写 profile node_modules 顶层时不会波及，插件保持自包含。
+  copyDir('node_modules');
+  // dsh-webui-market 的离线目录快照（官网不可达时的兜底数据）。
+  copyDir('data');
+}
+
+// 随插件/皮肤包一起拷贝到 profile 的许可与出处文件（存在才拷贝）。
+const EXTRA_PACKAGE_FILES = ['LICENSE', 'LICENSE.md', 'NOTICE', 'NOTICE.md', 'README.md', 'README.zh.md', 'THIRD-PARTY-NOTICES.md'];
+
+// pnpm（dsh plugin add / 插件市场）hoist 进 profile node_modules 的
+// @deepseek-ai 核心包真实拷贝，会遮蔽 <home>/profiles/node_modules 里指向
+// 随应用分发的安装闭包 junction，形成模块双实例：Symbol 身份不一致，
+// 作用域注册失效（如 "deployment:persona is already registered"），
+// 模型列表刷新、模式切换、工作区添加等全部瘫痪。启动时清掉这些
+// 遮蔽拷贝，让解析回落到 junction —— 与宿主同源、全局单实例。
+function healProfileModules() {
+  try {
+    const home = dshHome || path.join(os.homedir(), '.dsh');
+    const removed = healProfileModuleShadowing(home);
+    if (removed.length) log('boot', '已清理 profile node_modules 中遮蔽安装闭包的包拷贝: ' + removed.join(', '));
+  } catch (err) {
+    log('boot', '清理 profile 模块遮蔽失败: ' + err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 插件市场排队任务：服务运行中安装/卸载撞上 Windows 文件锁（EPERM，如
+// sqlite-vec 的 vec0.dll 被运行中的 web 进程加载）时，市场插件把任务写进
+// profile 的 .dsh-market-pending.json。这里在"无服务进程持锁"的窗口期
+// （应用启动时 / 原地重启 kill 完旧进程后）用 dsh CLI 完成它。
+// ---------------------------------------------------------------------------
+const MARKER_NAME = '.dsh-market-pending.json';
+const MARKER_MAX_ATTEMPTS = 3;
+
+// 删除排队标记文件。曾有残留进程短暂持锁导致 rmSync 静默失败、标记
+// "复活"并反复触发 pnpm 的案例 —— 这里带重试 + 改名兜底，并返回是否
+// 真正删除，调用方据此决定是否放弃任务。
+function removeMarkerFile(file) {
+  try {
+    fs.rmSync(file, { force: true, maxRetries: 5, retryDelay: 200 });
+  } catch { /* 落到改名兜底 */ }
+  if (!fs.existsSync(file)) return true;
+  try {
+    fs.renameSync(file, file + '.stale-' + Date.now());
+  } catch { /* 锁着也无可奈何，交给 attempts 上限 */ }
+  return !fs.existsSync(file);
+}
+
+function pendingMarketMarkers() {
+  const out = [];
+  try {
+    const home = dshHome || path.join(os.homedir(), '.dsh');
+    const profilesRoot = path.join(home, 'profiles');
+    if (!fs.existsSync(profilesRoot)) return out;
+    for (const entry of fs.readdirSync(profilesRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const marker = path.join(profilesRoot, entry.name, MARKER_NAME);
+      if (!fs.existsSync(marker)) continue;
+      try {
+        // 去掉可能的 UTF-8 BOM（外部编辑器写入的标记）再解析。
+        const job = JSON.parse(fs.readFileSync(marker, 'utf8').replace(/^\uFEFF/, ''));
+        if (job && typeof job.target === 'string' && job.target
+          && typeof job.profile === 'string' && /^[A-Za-z0-9_-]+$/.test(job.profile)
+          && (job.kind === 'install' || job.kind === 'uninstall')) {
+          out.push({ marker, job });
+        } else {
+          log('market-pending', '标记字段不完整，已删除: ' + marker);
+          removeMarkerFile(marker);
+        }
+      } catch (err) {
+        log('market-pending', `标记损坏，已删除: ${marker} (${err.message})`);
+        removeMarkerFile(marker);
+      }
+    }
+  } catch (err) {
+    log('market-pending', '扫描排队任务失败: ' + err.message);
+  }
+  return out;
+}
+
+function finishMarketMarker(marker, job, attempts, ok, tail) {
+  if (ok) {
+    log('market-pending', '排队任务完成: ' + (job.label || job.target));
+    if (!removeMarkerFile(marker)) {
+      log('market-pending', '警告: 排队标记删除失败（文件被占用？），已尝试改名兜底');
+    }
+    return;
+  }
+  if (attempts >= MARKER_MAX_ATTEMPTS) {
+    const last = String(tail || '').split(/\r?\n/).filter(Boolean).pop() || '';
+    log('market-pending', `排队任务连续 ${attempts} 次失败，放弃并清除: ${job.label || job.target}${last ? ' — ' + last.slice(0, 200) : ''}`);
+    removeMarkerFile(marker);
+    return;
+  }
+  try { fs.writeFileSync(marker, JSON.stringify({ ...job, attempts }, null, 2)); } catch {}
+  log('market-pending', '排队任务失败（下次启动重试）: ' + (job.label || job.target));
+}
+
+// 必须在"没有任何 dsh web 进程持锁"时调用；调用方负责先等待旧进程退出。
+function processPendingMarketOps() {
+  return new Promise((resolve) => {
+    const items = pendingMarketMarkers();
+    if (items.length === 0) return resolve(false);
+    const nodeBin = nodeExe();
+    const bin = dshBin();
+    if (!fs.existsSync(nodeBin) || !fs.existsSync(bin)) {
+      log('market-pending', '找不到 node/dsh CLI，跳过排队任务');
+      return resolve(false);
+    }
+    log('market-pending', `发现 ${items.length} 个排队任务，开始执行（Web 服务启动前，无文件锁）`);
+    let idx = 0;
+    const next = () => {
+      if (idx >= items.length) {
+        // pnpm 可能重新 hoist 出 @deepseek-ai 遮蔽拷贝，装完立刻清理，
+        // 避免模块双实例（Symbol 身份不一致）问题拖到下次启动。
+        healProfileModules();
+        return resolve(true);
+      }
+      const { marker, job } = items[idx++];
+      const attempts = Number(job.attempts || 0) + 1;
+      const action = job.kind === 'uninstall' ? 'remove' : 'add';
+      log('market-pending', `执行(${attempts}/${MARKER_MAX_ATTEMPTS}): dsh plugin --profile ${job.profile} ${action} ${job.target}`);
+      const child = spawn(nodeBin, [bin, 'plugin', '--profile', job.profile, action, job.target], {
+        cwd: userDataDir,
+        // CI=true 与市场插件 host 侧一致：pnpm v10 无 TTY 时对被忽略的构建
+        // 脚本（如 node-llama-cpp）静默放行，而不是 ERR_PNPM_IGNORED_BUILDS 硬失败。
+        env: { ...childEnv(), CI: 'true' },
+        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let tail = '';
+      const onData = (c) => {
+        const text = c.toString();
+        tail = (tail + text).slice(-8000);
+        for (const line of text.split(/\r?\n/)) {
+          const s = line.trim();
+          // Progress: \r 进度条不进日志，只保留有信息量的行。
+          if (s && !/^Progress:/.test(s)) log('market-pending', s.slice(0, 300));
+        }
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      const timer = setTimeout(() => {
+        log('market-pending', '排队任务超时（5 分钟），强制终止');
+        try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); } catch {}
+      }, 5 * 60 * 1000);
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        finishMarketMarker(marker, job, attempts, false, String(err.message));
+        next();
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        finishMarketMarker(marker, job, attempts, code === 0, tail);
+        next();
+      });
+    };
+    next();
+  });
+}
+
+function syncCompanionPlugins() {
+  if (!IS_WIN) return;
+  try {
+    const home = dshHome || path.join(os.homedir(), '.dsh');
+    const profileDirP = path.join(home, 'profiles', 'web');
+    // 内置社区 agent preset（anchored-standard：首请求锚定 Minimal 工具对，
+    // 首次工具调用/回复后开放完整 Standard 目录）：安装到用户 preset 根。
+    // preset 不进插件树，坏 preset 不会拖垮启动；已存在则跳过（用户手装
+    // 或改过的版本优先），见 preset-sync.js。
+    const presetsSynced = syncBundledPresets(
+      path.join(__dirname, 'assets', 'agent-presets'),
+      path.join(home, '.agent-presets'),
+      (m) => log('boot', m)
+    );
+    if (presetsSynced.installed.length) log('boot', '已安装内置 agent preset: ' + presetsSynced.installed.join(', '));
+    // 默认 preset 指到内置的 anchored-standard（用户已在 settings.yaml 写过
+    // default 则一律保留）。失败只降级为官方默认 preset，不影响启动。
+    const defaultResult = ensureDefaultAgentPreset(home, 'anchored-standard', (m) => log('boot', m));
+    if (defaultResult === 'set') log('boot', '已设置默认 agent preset: anchored-standard');
+    else if (defaultResult === 'kept') log('boot', '用户已设置默认 agent preset，保持不变');
+    fs.mkdirSync(path.join(profileDirP, 'node_modules'), { recursive: true });
+    const pending = [];
+    for (const p of COMPANION_PLUGINS) {
+      // 非 @deepseek-ai 作用域的配套包用显式 dir 指定 assets/plugins 下的目录名。
+      const src = path.join(__dirname, 'assets', 'plugins', p.dir || p.name.slice('@deepseek-ai/'.length));
+      if (!fs.existsSync(path.join(src, 'package.json'))) continue;
+      copyPluginPackage(profileDirP, src, p.name);
+      pending.push({ id: p.id, name: p.name, disabled: false, config: p.config });
+    }
+    // 内置皮肤：行 id 取皮肤包 skin.json 的 wiring.id（ui-skin-*）。
+    for (const entry of fs.readdirSync(SKINS_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const src = path.join(SKINS_DIR, entry.name);
+      const pkg = readJsonFile(path.join(src, 'package.json'));
+      if (!pkg || typeof pkg.name !== 'string' || !pkg.name.includes('/')) continue;
+      const skin = readJsonFile(path.join(src, 'skin.json'));
+      const rowId = skin && skin.wiring && typeof skin.wiring.id === 'string' ? skin.wiring.id : '';
+      if (!/^ui-skin-[\w-]+$/.test(rowId)) continue;
+      copyPluginPackage(profileDirP, src, pkg.name);
+      pending.push({ id: rowId, name: pkg.name, disabled: true });
+    }
+    // 注册到 profile 的 patch 层（幂等：已有行不重写，用户选择的皮肤/disabled 状态保留）。
+    const patchFile = path.join(profileDirP, 'cordis.patch.yml');
+    let patch = '';
+    try { patch = fs.readFileSync(patchFile, 'utf8'); } catch { patch = ''; }
+    let changed = false;
+    // 清理已移除的插件（easy-setup / tool-vision / soul-md / tdai-memory）
+    const removedPluginIds = ['easy-setup', 'tool-vision', 'soul-md', 'tdai-memory'];
+    const purged = removePluginRows(patch, removedPluginIds);
+    if (purged.removed.length) {
+      patch = purged.patch;
+      changed = true;
+      log('boot', '已从 profile patch 移除已剔除插件: ' + purged.removed.join(', '));
+    }
+    const removedDirs = ['dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory'];
+    for (const rdir of removedDirs) {
+      const p = path.join(profileDirP, 'node_modules', rdir);
+      if (fs.existsSync(p)) {
+        try { fs.rmSync(p, { recursive: true, force: true }); } catch {}
+      }
+    }
+
+    // 市场安装（dsh plugin add）会把插件登记进 package.json 的
+    // dsh.profile.bundles，加载时执行其包内 patch 挂载行；若 overlay 里
+    // 也有一行（syncCompanionPlugins 写的），整个插件树会以
+    // “duplicate loader entry id” 崩溃。清掉 overlay 重复行（包内行保留）。
+    let bundled = [];
+    try { bundled = readJsonFile(path.join(profileDirP, 'package.json'))?.dsh?.profile?.bundles || []; } catch { bundled = []; }
+    const rowIds = {};
+    for (const p of COMPANION_PLUGINS) rowIds[p.id] = p.name;
+    const deduped = removeBundledRowDuplicates(patch, rowIds, bundled);
+    if (deduped.removed.length) {
+      patch = deduped.patch;
+      changed = true;
+      log('boot', '已移除与 bundle 登记重复的 patch 行: ' + deduped.removed.join(', '));
+    }
+    for (const p of pending) {
+      if (new RegExp('id:\\s*' + p.id + '\\b').test(patch)) continue;
+      // 已在 bundle 列表里的插件由其包内 patch 挂载，overlay 不能再写行
+      // （会 duplicate loader entry id，拖垮整个插件树）。
+      if (bundled.includes(p.name)) continue;
+      let block = `- insert:\n    - id: ${p.id}\n      name: '${p.name}'\n`;
+      if (p.config) block += configLinesFor(p.config);
+      if (p.disabled) block += `      disabled: true\n`;
+      if (/^\s*\[\]\s*$/m.test(patch)) patch = patch.replace(/\[\]/m, block);
+      else if (patch.trim() === '') patch = '# dsh web profile patch（由 DSH Desktop 维护）\n' + block;
+      else patch = patch.replace(/\s*$/, '\n') + block;
+      changed = true;
+    }
+    if (changed) {
+      fs.writeFileSync(patchFile, patch);
+      log('boot', '已同步配套插件/皮肤到 web profile: ' + pending.map((p) => p.id).join(', '));
+    }
+  } catch (err) {
+    log('boot', '同步配套插件失败: ' + err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 快捷方式维护：修复「没有桌面快捷方式 / 快捷方式指向的文件消失」，
+// 并让快捷方式图标跟随图标设计更新（.lnk 单独指定 icon.ico）。
+// ---------------------------------------------------------------------------
+
+// 图标设计版本：更换图标时 +1，触发所有快捷方式图标刷新。
+const SHORTCUT_ICON_VERSION = 'whale-custom-v2';
+
+function shortcutIconPath() {
+  // 复制到 userData 保证路径稳定（便携版 exe 解压目录每次启动都会变）。
+  const ico = path.join(userDataDir, 'icon.ico');
+  try {
+    const src = path.join(__dirname, 'assets', 'icon.ico');
+    if (!fs.existsSync(src)) return '';
+    if (!fs.existsSync(ico) || fs.statSync(src).size !== fs.statSync(ico).size) {
+      fs.copyFileSync(src, ico);
+    }
+    return ico;
+  } catch (err) {
+    log('boot', '复制快捷方式图标失败: ' + err.message);
+    return path.join(__dirname, 'assets', 'icon.ico');
+  }
+}
+
+function maintainShortcuts() {
+  if (!app.isPackaged || !IS_WIN) return;
+  try {
+    const target = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+    const settings = updater.loadSettings(updCtx());
+    const linksDir = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Start Menu', 'Programs');
+    const APP_TITLE = 'DeepSeek Harness';
+    const startMenu = path.join(linksDir, APP_TITLE + '.lnk');
+    const ico = shortcutIconPath();
+    const opts = {
+      target,
+      description: 'DeepSeek Harness 桌面客户端',
+      ...(ico ? { icon: ico, iconIndex: 0 } : {}),
+      appUserModelId: 'com.deepseek.dsh.desktop',
+    };
+    let changed = false;
+    // 清理旧名称快捷方式
+    for (const legacy of [
+      path.join(linksDir, 'DSH Desktop.lnk'),
+      path.join(app.getPath('desktop'), 'DSH Desktop.lnk'),
+      path.join(linksDir, 'Deepseek Harness EAC.lnk'),
+      path.join(linksDir, 'Deepseek Harness EAC v2.0.lnk'),
+      path.join(linksDir, 'Deepseek Harness EAC v1.0.lnk'),
+    ]) {
+      try { if (fs.existsSync(legacy)) { fs.rmSync(legacy); changed = true; } } catch {}
+    }
+    // exe 被移动过，或图标设计更新过：替换现有快捷方式（修复“指向的文件消失”）。
+    if ((settings.shortcutTarget && settings.shortcutTarget !== target) || settings.shortcutIcon !== SHORTCUT_ICON_VERSION) {
+      if (fs.existsSync(startMenu)) {
+        try { shell.writeShortcutLink(startMenu, 'replace', opts); changed = true; } catch {}
+      }
+    }
+    // 缺失则创建：开始菜单快捷方式是系统通知的前置条件（桌面快捷方式不再自动创建）。
+    if (!fs.existsSync(startMenu)) {
+      try { shell.writeShortcutLink(startMenu, 'create', opts); changed = true; } catch {}
+    }
+    if (changed) {
+      settings.shortcutTarget = target;
+      settings.shortcutIcon = SHORTCUT_ICON_VERSION;
+      updater.saveSettings(updCtx(), settings);
+      log('boot', '快捷方式已维护（开始菜单 → ' + target + '，图标 ' + SHORTCUT_ICON_VERSION + '）');
+    }
+  } catch (err) {
+    log('boot', '快捷方式维护失败: ' + err.message);
+  }
+}
+
+function warnTempRun() {
+  if (!app.isPackaged || !IS_WIN || !process.env.PORTABLE_EXECUTABLE_DIR) return;
+  const dir = process.env.PORTABLE_EXECUTABLE_DIR.toLowerCase();
+  const tmp = os.tmpdir().toLowerCase();
+  if (dir === tmp || dir.startsWith(tmp + path.sep)) {
+    showBox({
+      type: 'warning',
+      title: '正在从临时目录运行',
+      message: '当前便携版位于系统临时目录。',
+      detail: '临时目录中的文件可能被系统自动清理，导致快捷方式失效或程序“消失”。\n建议把 DeepSeek Harness exe 移动到固定位置（如桌面或 D 盘）后再运行。',
+      buttons: ['知道了'],
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 预览静态文件服务：独立端口的只读文件服务，供「站内 HTML 预览」的 iframe 使用。
+// 为什么要独立端口：浏览器对同一主机 HTTP/1.1 并发连接上限 6，web UI 自身
+// 长连接已占满；预览 iframe 及其相对资源若走 dsh 宿主会被排队。仅接受回环。
+// ---------------------------------------------------------------------------
+
+let previewStaticPort = 0;
+
+function startPreviewStaticServer() {
+  const MIME = {
+    ".html": "text/html", ".htm": "text/html", ".xhtml": "application/xhtml+xml",
+    ".css": "text/css", ".js": "text/javascript", ".mjs": "text/javascript", ".cjs": "text/javascript",
+    ".json": "application/json", ".map": "application/json", ".txt": "text/plain", ".md": "text/plain", ".csv": "text/plain",
+    ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+    ".webp": "image/webp", ".ico": "image/x-icon", ".avif": "image/avif",
+    ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf", ".otf": "font/otf",
+    ".wasm": "application/wasm", ".mp4": "video/mp4", ".webm": "video/webm", ".ogg": "video/ogg",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".pdf": "application/pdf", ".xml": "application/xml"
+  };
+  const TEXT_MIME = /^(text\/|application\/(json|javascript|xhtml\+xml|xml)|image\/svg)/;
+  const server = http.createServer((req, res) => {
+    const ra = req.socket && req.socket.remoteAddress;
+    if (ra !== "127.0.0.1" && ra !== "::1" && ra !== "::ffff:127.0.0.1") {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(405, { allow: "GET, HEAD" });
+      res.end();
+      return;
+    }
+    let p;
+    try {
+      p = decodeURIComponent(new URL(req.url, "http://127.0.0.1").pathname.slice(1));
+    } catch {
+      res.writeHead(400);
+      res.end();
+      return;
+    }
+    if (/^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1);
+    if (!path.isAbsolute(p)) {
+      res.writeHead(400);
+      res.end();
+      return;
+    }
+    try {
+      const st = fs.statSync(p);
+      if (!st.isFile()) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      const mime = MIME[path.extname(p).toLowerCase()] || "application/octet-stream";
+      res.writeHead(200, {
+        "content-type": TEXT_MIME.test(mime) ? mime + "; charset=utf-8" : mime,
+        "content-length": String(st.size),
+        "cache-control": "no-store"
+      });
+      if (req.method === "HEAD") { res.end(); return; }
+      fs.createReadStream(p).pipe(res);
+    } catch {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  server.listen(0, "127.0.0.1", () => {
+    previewStaticPort = server.address().port;
+    log("boot", "预览静态服务已启动: http://127.0.0.1:" + previewStaticPort);
+  });
+  server.on("error", (err) => log("boot", "预览静态服务失败: " + err.message));
+}
+
+function boot() {
+  // Portable builds keep all data next to the exe.
+  if (!app.isPackaged && process.env.DSH_DESKTOP_USERDATA) {
+    app.setPath('userData', process.env.DSH_DESKTOP_USERDATA);
+  } else if (process.env.PORTABLE_EXECUTABLE_DIR) {
+    app.setPath('userData', path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'data'));
+  }
+
+  userDataDir = app.getPath('userData');
+  logsDir = path.join(userDataDir, 'logs');
+  // DSH_HOME: respect an explicit override; otherwise let dsh use its own
+  // default (~/.dsh), so the desktop app shares config/sessions with the CLI.
+  dshHome = process.env.DSH_HOME || '';
+  fs.mkdirSync(logsDir, { recursive: true });
+  if (dshHome) fs.mkdirSync(dshHome, { recursive: true });
+  desktopLog = fs.createWriteStream(path.join(logsDir, 'desktop.log'), { flags: 'a' });
+  log('boot', `DeepSeek Harness（版本 ${APP_VERSION}）  userData=${userDataDir}  dshHome=${dshHome || '(dsh 默认)'}  agent=${dshVersion()}(${dshVersionSource()})`);
+
+  // 移除原生菜单栏（文件/视图/帮助），全部功能由自绘 chrome 与托盘提供。
+  Menu.setApplicationMenu(null);
+  createWindow();
+  startPreviewStaticServer();
+  registerChromeIpc();
+  createTray();
+  syncCompanionPlugins();
+  healProfileModules();
+  // 插件市场排队任务（服务运行中撞文件锁转待重启的安装/卸载）：趁服务
+  // 尚未启动、无文件锁时先完成，再拉起 Web 服务。
+  processPendingMarketOps()
+    .then((hasPendingOps) => {
+      // 仅当真正执行了排队的 pnpm 操作时，才需要重新同步和清理
+      if (hasPendingOps) {
+        syncCompanionPlugins();
+        healProfileModules();
+      }
+    })
+    .then(() => startAndShow())
+    .then(() => {
+      // Session-completion notifications: watch dsh session logs under the
+      // effective DSH_HOME (same config the CLI uses).
+      const s = updater.loadSettings(updCtx());
+      notifyOnTurnEnd = s.notifyOnTurnEnd !== false;
+      const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+      sessionWatcher = new SessionWatcher({
+        sessionsDir: path.join(home, 'sessions'),
+        log,
+        onTurnEnd: (info) => onSessionTurnEnd(info),
+      });
+      sessionWatcher.start();
+      maintainShortcuts();
+      warnTempRun();
+      startBalanceLoop();
+
+      if (!process.env.DSH_DESKTOP_SKIP_AUTO_UPDATE) {
+        // dsh 内核 agent 更新：启动 15 秒后 + 每 6 小时。
+        setTimeout(() => runUpdateFlow(false), 15000).unref();
+        setInterval(() => runUpdateFlow(false), AUTO_UPDATE_INTERVAL_MS).unref();
+      }
+    })
+    .catch((err) => handleBootFailure(err));
+}
+
+// ---------------------------------------------------------------------------
+// App lifecycle
+// ---------------------------------------------------------------------------
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.setAppUserModelId('com.deepseek.dsh.desktop');
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+  app.on('before-quit', () => {
+    quitting = true;
+    forceQuit = true;
+    log('boot', '正在退出，停止 dsh web 进程树…');
+    killTree(serverProc);
+    updater.abort();
+    if (sessionWatcher) sessionWatcher.stop();
+    if (balanceTimer) clearInterval(balanceTimer);
+    if (tray) { try { tray.destroy(); } catch {} tray = null; }
+  });
+  // 关闭窗口后常驻托盘；托盘不存在时才随窗口退出。
+  app.on('window-all-closed', () => {
+    if (!IS_WIN || !tray) app.quit();
+  });
+  app.whenReady().then(boot).catch((err) => fatal('应用初始化失败', err));
+}
