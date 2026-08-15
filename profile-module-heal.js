@@ -57,4 +57,41 @@ function healProfileModuleShadowing(home, log = () => {}) {
   return removed;
 }
 
-module.exports = { healProfileModuleShadowing };
+function healCustomModelReasoning(roots = [], log = () => {}) {
+  const targetPattern = /efforts === void 0\)\s*return \{ reasoning: base\?\.reasoning \?\? false \};/;
+  const patchedCode = `efforts === void 0) {
+\t\tif (base?.reasoning !== void 0) return { reasoning: base.reasoning };
+\t\treturn {
+\t\t\treasoning: true,
+\t\t\tthinkingLevelMap: {
+\t\t\t\tminimal: "minimal",
+\t\t\t\tlow: "low",
+\t\t\t\tmedium: "medium",
+\t\t\t\thigh: "high",
+\t\t\t\txhigh: "xhigh",
+\t\t\t\tmax: "max"
+\t\t\t}
+\t\t};
+\t}`;
+
+  let patchedCount = 0;
+  for (const root of roots) {
+    if (!root) continue;
+    const targetFile = path.join(root, 'node_modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'lib', 'index.js');
+    if (!fs.existsSync(targetFile)) continue;
+    try {
+      const content = fs.readFileSync(targetFile, 'utf8');
+      if (targetPattern.test(content)) {
+        const next = content.replace(targetPattern, patchedCode);
+        fs.writeFileSync(targetFile, next, 'utf8');
+        patchedCount++;
+        log('已自愈自定义供应商模型推理等级支持: ' + targetFile);
+      }
+    } catch (err) {
+      log('自愈自定义供应商模型失败: ' + (err && err.message));
+    }
+  }
+  return patchedCount;
+}
+
+module.exports = { healProfileModuleShadowing, healCustomModelReasoning };

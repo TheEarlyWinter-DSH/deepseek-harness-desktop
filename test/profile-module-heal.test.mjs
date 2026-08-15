@@ -17,10 +17,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, lstatSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, lstatSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { healProfileModuleShadowing } from '../profile-module-heal.js';
+import { healProfileModuleShadowing, healCustomModelReasoning } from '../profile-module-heal.js';
 
 /** Build a fake DSH home: fallback junctions + a web profile node_modules. */
 function makeHome() {
@@ -110,5 +110,28 @@ test('is a no-op when the fallback directory does not exist', () => {
     assert.deepEqual(removed, [], 'nothing to shadow — nothing removed');
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healCustomModelReasoning: 自动修复自定义供应商模型推理等级缺失', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-heal-reasoning-'));
+  try {
+    const targetDir = join(root, 'node_modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'lib');
+    mkdirSync(targetDir, { recursive: true });
+    const targetFile = join(targetDir, 'index.js');
+    const original = 'function resolveModelReasoning(provider, entry, base) {\n\tconst efforts = entry.reasoningEfforts;\n\tif (efforts === void 0) return { reasoning: base?.reasoning ?? false };\n\tif (efforts === false) return { reasoning: false };\n}';
+    writeFileSync(targetFile, original, 'utf8');
+
+    const patched = healCustomModelReasoning([root]);
+    assert.equal(patched, 1);
+    const result = readFileSync(targetFile, 'utf8');
+    assert.match(result, /reasoning: true/);
+    assert.match(result, /minimal: "minimal"/);
+
+    // 再次运行保证幂等
+    const second = healCustomModelReasoning([root]);
+    assert.equal(second, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

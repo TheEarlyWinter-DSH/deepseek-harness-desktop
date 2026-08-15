@@ -22,7 +22,7 @@ const http = require('node:http');
 const os = require('node:os');
 
 const updater = require('./updater');
-const { healProfileModuleShadowing } = require('./profile-module-heal');
+const { healProfileModuleShadowing, healCustomModelReasoning } = require('./profile-module-heal');
 const { configLinesFor, removeBundledRowDuplicates, removePluginRows } = require('./patch-row-heal');
 const { syncBundledPresets, ensureDefaultAgentPreset } = require('./preset-sync');
 const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
@@ -970,6 +970,12 @@ function healProfileModules() {
     const home = dshHome || path.join(os.homedir(), '.dsh');
     const removed = healProfileModuleShadowing(home);
     if (removed.length) log('boot', '已清理 profile node_modules 中遮蔽安装闭包的包拷贝: ' + removed.join(', '));
+    const roots = [
+      path.join(__dirname),
+      path.join(home, 'overlay'),
+    ];
+    const patched = healCustomModelReasoning(roots, (msg) => log('boot', msg));
+    if (patched) log('boot', `已自愈 ${patched} 处自定义供应商模型推理等级支持`);
   } catch (err) {
     log('boot', '清理 profile 模块遮蔽失败: ' + err.message);
   }
