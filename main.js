@@ -601,35 +601,6 @@ async function runUpdateFlow(manual) {
 
 const lastNotifyAt = new Map(); // sessionId -> timestamp (rate-limit)
 
-async function triggerBridgePush(title, body) {
-  try {
-    const cfgFile = path.join(dshHome || path.join(os.homedir(), '.dsh'), 'bridge-config.json');
-    if (!fs.existsSync(cfgFile)) return;
-    const cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
-    if (!cfg.enabled) return;
-
-    if (cfg.barkUrl && cfg.barkUrl.trim().length > 0) {
-      const base = cfg.barkUrl.trim().replace(/\/+$/, '');
-      const url = `${base}/${encodeURIComponent(title)}/${encodeURIComponent(body)}?group=DSH`;
-      fetch(url).catch(() => {});
-    }
-    if (cfg.feishuWebhook && cfg.feishuWebhook.trim().length > 0) {
-      fetch(cfg.feishuWebhook.trim(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ msg_type: 'text', content: { text: `【${title}】\n${body}` } })
-      }).catch(() => {});
-    }
-    if (cfg.customWebhook && cfg.customWebhook.trim().length > 0) {
-      fetch(cfg.customWebhook.trim(), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, body, timestamp: Date.now() })
-      }).catch(() => {});
-    }
-  } catch {}
-}
-
 function onSessionTurnEnd(info) {
   if (!notifyOnTurnEnd || quitting) return;
   const now = Date.now();
@@ -640,9 +611,6 @@ function onSessionTurnEnd(info) {
 
   const title = info.title || 'DSH 任务完成';
   const body = info.body || '会话任务已完成';
-
-  // 跨端手机推送
-  triggerBridgePush(title, body);
 
   try {
     const n = new Notification({
@@ -947,7 +915,6 @@ const COMPANION_PLUGINS = [
   { id: 'interactive-cards', name: '@deepseek-ai/dsh-interactive-cards', dir: 'dsh-interactive-cards' },
   { id: 'skill-loader', name: '@deepseek-ai/dsh-skill-loader', dir: 'dsh-skill-loader' },
   { id: 'artifacts', name: '@deepseek-ai/dsh-artifacts', dir: 'dsh-artifacts' },
-  { id: 'bridge-remote', name: '@deepseek-ai/dsh-bridge-remote', dir: 'dsh-bridge-remote' },
 ];
 
 // 皮肤包目录：assets/skins/<id>/。每个皮肤是一个完整的 dsh client 插件包
@@ -1211,15 +1178,15 @@ function syncCompanionPlugins() {
     let patch = '';
     try { patch = fs.readFileSync(patchFile, 'utf8'); } catch { patch = ''; }
     let changed = false;
-    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory）
-    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory'];
+    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory / bridge-remote）
+    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory', 'bridge-remote'];
     const purged = removePluginRows(patch, removedPluginIds);
     if (purged.removed.length) {
       patch = purged.patch;
       changed = true;
       log('boot', '已从 profile patch 移除已剔除插件: ' + purged.removed.join(', '));
     }
-    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory'];
+    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory', '@deepseek-ai/dsh-bridge-remote'];
     for (const rdir of removedDirs) {
       const p = path.join(profileDirP, 'node_modules', ...rdir.split('/'));
       if (fs.existsSync(p)) {

@@ -114,7 +114,7 @@ export function apply(ctx) {
           return sendJson(res, 404, { ok: false, error: "文件不存在" });
         }
         if (process.platform === "win32") {
-          execFile("explorer.exe", ["/select,", targetPath], () => {});
+          execFile("explorer.exe", [`/select,${targetPath}`], () => {});
         }
         sendJson(res, 200, { ok: true });
       }

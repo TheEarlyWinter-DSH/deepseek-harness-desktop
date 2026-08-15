@@ -37,7 +37,7 @@ export function apply(ctx) {
             skills.push({
               id: entry.name,
               name: nameMatch ? nameMatch[1].trim() : entry.name,
-              desc: descMatch ? descMatch[1].trim() : "",
+              desc: descMatch ? descMatch[1].trim().replace(/^["']|["']$/g, "") : "",
               path: skillFile
             });
           }
