@@ -38,7 +38,6 @@ const dshDesktop = {
     action: (action, payload) => ipcRenderer.invoke('chrome:menu', { action, ...payload }),
   },
   getInfo: () => ipcRenderer.invoke('chrome:init'),
-  refreshBalance: () => ipcRenderer.invoke('dsh:balance-refresh'),
   // 插件市场：请求主进程原地重启 dsh web 服务（安装/卸载插件后生效）。
   restartService: () => ipcRenderer.invoke('chrome:restart-service', { intent: 'restart-service' }),
   // 「文件」视图的还原请求：changes = [{path, op, oldText, newText}]（逆序）。
@@ -59,11 +58,6 @@ window.addEventListener('error', (e) => {
 });
 window.addEventListener('unhandledrejection', (e) => {
   try { ipcRenderer.send('dsh:page-error', 'unhandledrejection: ' + String((e && e.reason && (e.reason.message || e.reason)) || e)); } catch {}
-});
-
-// 余额推送 → window 事件（dsh-balance 插件订阅）。
-ipcRenderer.on('dsh:balance', (_e, data) => {
-  try { window.dispatchEvent(new CustomEvent('dsh-balance-changed', { detail: data })); } catch {}
 });
 
 // ---------------------------------------------------------------------------

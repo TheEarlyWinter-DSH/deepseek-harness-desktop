@@ -22,7 +22,6 @@ const http = require('node:http');
 const os = require('node:os');
 
 const updater = require('./updater');
-const balance = require('./balance');
 const { healProfileModuleShadowing } = require('./profile-module-heal');
 const { configLinesFor, removeBundledRowDuplicates, removePluginRows } = require('./patch-row-heal');
 const { syncBundledPresets, ensureDefaultAgentPreset } = require('./preset-sync');
@@ -92,8 +91,6 @@ let dshHome = '';
 let desktopLog = null;
 let tray = null;
 let forceQuit = false;
-let balanceCache = null;
-let balanceTimer = null;
 let restartingServer = false;
 
 // ---------------------------------------------------------------------------
@@ -765,11 +762,6 @@ function registerChromeIpc() {
     log('page-error', String(payload));
   });
 
-  ipcMain.handle('dsh:balance-refresh', async (event) => {
-    if (!mainWindow || event.sender !== mainWindow.webContents) return balanceCache;
-    return refreshBalance();
-  });
-
   // 文件还原（「文件」视图的回退）：按会话日志里已持久化的写前/写后全文，
   // 做精确内容匹配后替换 —— 只有内容一致才动手，天然幂等且安全。
   ipcMain.handle('dsh:file-revert', async (event, { changes } = {}) => {
@@ -904,42 +896,10 @@ function createTray() {
 }
 
 // ---------------------------------------------------------------------------
-// DeepSeek 余额（推送到 Web UI 的 dsh-balance 插件）
-// ---------------------------------------------------------------------------
-
-async function refreshBalance() {
-  const home = dshHome || path.join(os.homedir(), '.dsh');
-  let result;
-  try {
-    result = await balance.queryBalance(home);
-  } catch (err) {
-    result = { ok: false, error: String((err && err.message) || err), balances: [] };
-  }
-  // 按当前默认模型选择价格档（settings.json 可覆盖 balancePrices.<model>）。
-  const model = balance.readActiveModel(home) || 'deepseek-v4-pro';
-  const table = result.prices || balance.DEFAULT_PRICES;
-  const s = updater.loadSettings(updCtx());
-  const override = s.balancePrices && s.balancePrices[model];
-  result.prices = { ...(table[model] || balance.FALLBACK_PRICES), ...(override || {}) };
-  balanceCache = result;
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('dsh:balance', result);
-  }
-  return result;
-}
-
-function startBalanceLoop() {
-  refreshBalance().catch(() => {});
-  balanceTimer = setInterval(() => refreshBalance().catch(() => {}), 15 * 60 * 1000);
-  if (balanceTimer.unref) balanceTimer.unref();
-}
-
-// ---------------------------------------------------------------------------
-// 配套 dsh 插件同步（注入 web profile：余额小部件 + 文件更改追踪/还原 + 皮肤）
+// 配套 dsh 插件同步（注入 web profile：文件更改追踪/还原 + 皮肤）
 // ---------------------------------------------------------------------------
 
 const COMPANION_PLUGINS = [
-  { id: 'balance', name: '@deepseek-ai/dsh-balance' },
   { id: 'file-changes', name: '@deepseek-ai/dsh-file-changes' },
   { id: 'client-file-changes', name: '@deepseek-ai/dsh-client-file-changes' },
   { id: 'terminal', name: '@deepseek-ai/dsh-terminal' },
@@ -1196,17 +1156,17 @@ function syncCompanionPlugins() {
     let patch = '';
     try { patch = fs.readFileSync(patchFile, 'utf8'); } catch { patch = ''; }
     let changed = false;
-    // 清理已移除的插件（easy-setup / tool-vision / soul-md / tdai-memory）
-    const removedPluginIds = ['easy-setup', 'tool-vision', 'soul-md', 'tdai-memory'];
+    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory）
+    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory'];
     const purged = removePluginRows(patch, removedPluginIds);
     if (purged.removed.length) {
       patch = purged.patch;
       changed = true;
       log('boot', '已从 profile patch 移除已剔除插件: ' + purged.removed.join(', '));
     }
-    const removedDirs = ['dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory'];
+    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory'];
     for (const rdir of removedDirs) {
-      const p = path.join(profileDirP, 'node_modules', rdir);
+      const p = path.join(profileDirP, 'node_modules', ...rdir.split('/'));
       if (fs.existsSync(p)) {
         try { fs.rmSync(p, { recursive: true, force: true }); } catch {}
       }
@@ -1462,7 +1422,6 @@ function boot() {
       sessionWatcher.start();
       maintainShortcuts();
       warnTempRun();
-      startBalanceLoop();
 
       if (!process.env.DSH_DESKTOP_SKIP_AUTO_UPDATE) {
         // dsh 内核 agent 更新：启动 15 秒后 + 每 6 小时。
@@ -1496,7 +1455,6 @@ if (!gotLock) {
     killTree(serverProc);
     updater.abort();
     if (sessionWatcher) sessionWatcher.stop();
-    if (balanceTimer) clearInterval(balanceTimer);
     if (tray) { try { tray.destroy(); } catch {} tray = null; }
   });
   // 关闭窗口后常驻托盘；托盘不存在时才随窗口退出。

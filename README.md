@@ -12,7 +12,6 @@
 - ✅ **与 CLI 共享配置**：默认沿用 dsh 自身的 `DSH_HOME`（通常是 `~\.dsh`），已有会话与 API Key 直接生效
 - ✅ **跟随官方更新**：官方 `@deepseek-ai/dsh` 发新版时弹窗提醒，经确认后自动下载安装，重启生效，失败自动保留旧版
 - ✅ **快捷方式自动维护**：首次运行自动维护开始菜单快捷方式，支持系统级通知，exe 移动后自动纠正
-- ✅ **DeepSeek 余额小部件**：对话底部统计栏内联显示「本轮 ¥X.XX · 余额 ¥Y.YY」（自动注入配套 dsh 客户端插件，点击跳转充值）
 - ✅ **文件更改追踪 + 一键还原**：详情面板「文件」标签页，聚合本会话 agent 修改过的全部文件（新建/修改/删除、行级 diff、逐文件或全部还原）
 - ✅ **项目文件树与站内预览**：「文件」标签页提供层级文件树与站内 HTML/端口实时预览
 - ✅ **会话内终端**：「终端」标签页内置持久 PowerShell shell，支持流式输出、命令历史、清屏与断线重连
@@ -80,7 +79,6 @@ npm run dist
 dsh-desktop/
 ├── main.js               # Electron 主进程（窗口、托盘、自绘标题栏 IPC、快捷方式维护）
 ├── updater.js            # @deepseek-ai/dsh 官方内核更新引擎（npm view 检查 / overlay 安装）
-├── balance.js            # DeepSeek 账户余额与用量查询
 ├── session-watcher.js    # 会话完成监听（zstd 多帧解码 + turn/end 检测）
 ├── preload.js            # 预加载脚本（自绘玻璃标题栏、窗口控制、菜单 IPC）
 ├── preset-sync.js        # 预设同步与初始化
@@ -88,7 +86,7 @@ dsh-desktop/
 ├── patch-row-heal.js     # profile patch 配置管理与插件行维护
 ├── assets/               # 静态资源、加载动画、图标、配套插件
 │   ├── icon.ico          # 多分辨率专属 Windows 图标
-│   ├── plugins/          # 核心配套插件（余额、文件追踪、终端、皮肤切换、移动端修复等）
+│   ├── plugins/          # 核心配套插件（文件追踪、终端、皮肤切换、移动端修复等）
 │   └── skins/            # 内置主题皮肤包
 ├── scripts/
 │   ├── fetch-node.js     # 内置 node.exe 拉取与复制

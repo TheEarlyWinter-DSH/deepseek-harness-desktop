@@ -61,8 +61,8 @@ test('main.js: 支持清理已废弃插件行并同步配套插件', () => {
 test('removeBundledRowDuplicates: 删 bundle 已登记的 overlay 行', () => {
   const patch = [
     '- insert:',
-    '    - id: balance',
-    "      name: '@deepseek-ai/dsh-balance'",
+    '    - id: file-changes',
+    "      name: '@deepseek-ai/dsh-file-changes'",
     '- insert:',
     '    - id: mobile-fix',
     "      name: 'dsh-web-mobile-fix'",
@@ -71,11 +71,11 @@ test('removeBundledRowDuplicates: 删 bundle 已登记的 overlay 行', () => {
     "      name: '@deepseek-ai/dsh-terminal'",
     '',
   ].join('\n');
-  const rowIds = { balance: '@deepseek-ai/dsh-balance', 'mobile-fix': 'dsh-web-mobile-fix', terminal: '@deepseek-ai/dsh-terminal' };
+  const rowIds = { 'file-changes': '@deepseek-ai/dsh-file-changes', 'mobile-fix': 'dsh-web-mobile-fix', terminal: '@deepseek-ai/dsh-terminal' };
   const { patch: out, removed } = removeBundledRowDuplicates(patch, rowIds, ['dsh-web-mobile-fix']);
   assert.deepEqual(removed, ['mobile-fix']);
   assert.doesNotMatch(out, /mobile-fix/);
-  assert.match(out, /- id: balance/);
+  assert.match(out, /- id: file-changes/);
   assert.match(out, /- id: terminal/);
 });
 

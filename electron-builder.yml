@@ -18,7 +18,6 @@ buildDependenciesFromSource: false
 files:
   - main.js
   - updater.js
-  - balance.js
   - session-watcher.js
   - profile-module-heal.js
   - patch-row-heal.js

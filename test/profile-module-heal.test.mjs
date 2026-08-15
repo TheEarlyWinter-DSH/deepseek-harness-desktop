@@ -44,7 +44,7 @@ function makeHome() {
 
   // Web profile node_modules:
   mkdirSync(join(nm, '@deepseek-ai', 'dsh-scope'), { recursive: true }); // shadowing real copy — remove
-  mkdirSync(join(nm, '@deepseek-ai', 'dsh-balance'), { recursive: true }); // local-only plugin — keep
+  mkdirSync(join(nm, '@deepseek-ai', 'dsh-file-changes'), { recursive: true }); // local-only plugin — keep
   mkdirSync(join(nm, 'dsh-web-mobile-fix'), { recursive: true }); // local-only plugin — keep
   mkdirSync(join(nm, 'cosmokit'), { recursive: true }); // shadowing real copy (unscoped) — remove
   mkdirSync(join(sources, 'dsh-system-prompt-other'), { recursive: true }); // link-typed entry — keep
@@ -72,7 +72,7 @@ test('keeps packages that have no fallback counterpart', () => {
   try {
     healProfileModuleShadowing(home);
     const nm = join(home, 'profiles', 'web', 'node_modules');
-    assert.equal(existsSync(join(nm, '@deepseek-ai', 'dsh-balance')), true, 'local scoped plugin must be kept');
+    assert.equal(existsSync(join(nm, '@deepseek-ai', 'dsh-file-changes')), true, 'local scoped plugin must be kept');
     assert.equal(existsSync(join(nm, 'dsh-web-mobile-fix')), true, 'local unscoped plugin must be kept');
   } finally {
     rmSync(home, { recursive: true, force: true });
