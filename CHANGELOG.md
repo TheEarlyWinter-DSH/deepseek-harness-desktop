@@ -64,14 +64,13 @@ dsh CLI、桌面工作流与配套插件。
 - 内置插件/皮肤拷贝逻辑支持根目录入口文件、vendor、node_modules、data 目录。
 
 ### 说明
-- 安装版数据目录改为 `%APPDATA%\Deepseek Harness EAC v2.0\`；便携版仍跟随 exe。
-- 产物命名 `Deepseek-Harness-EAC-v2.0-Portable/Setup-x64.exe`，自更新链路自动适配。
+- 安装版数据目录使用 `%APPDATA%\DeepSeek Harness\`；便携版仍跟随 exe。
+- 产物命名 `DeepSeek-Harness-v2.0-Portable/Setup-x64.exe`，自更新链路自动适配。
 
 ## [1.0.0] — 2026-08-15
 
 ### 品牌与新定位
-- 项目更名 **Deepseek Harness EAC**（EAC = Embracing All Creation，揽尽万象）：
-  Windows 桌面客户端正式释出，产物统一命名 `Deepseek-Harness-EAC-v1.0-Portable/Setup-x64.exe`。
+- 项目统一命名为 **DeepSeek Harness**，Windows 桌面客户端正式释出，产物统一命名 `DeepSeek-Harness-v1.0-Portable/Setup-x64.exe`。
 - 自更新链路同步指向新仓库，产物命名与 electron-builder 配置对齐。
 
 ### 新增
@@ -90,7 +89,7 @@ dsh CLI、桌面工作流与配套插件。
   persona-scope、skin-chrome-zindex 等单测（`npm test`）。
 
 ### 说明
-- 便携版数据目录跟随 exe（`data\`）；安装版在 `%APPDATA%\Deepseek Harness EAC v1.0\`。
+- 便携版数据目录跟随 exe（`data\`）；安装版在 `%APPDATA%\DeepSeek Harness\`。
 - 与 dsh CLI 共享 `DSH_HOME`（默认 `~/.dsh`），已有会话/凭据直接生效。
 
 ## [0.2.0] — 2026-08-14

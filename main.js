@@ -1375,13 +1375,10 @@ function maintainShortcuts() {
       appUserModelId: 'com.deepseek.dsh.desktop',
     };
     let changed = false;
-    // 清理旧名称快捷方式
+    // 清理早期通用名称的快捷方式。
     for (const legacy of [
       path.join(linksDir, 'DSH Desktop.lnk'),
       path.join(app.getPath('desktop'), 'DSH Desktop.lnk'),
-      path.join(linksDir, 'Deepseek Harness EAC.lnk'),
-      path.join(linksDir, 'Deepseek Harness EAC v2.0.lnk'),
-      path.join(linksDir, 'Deepseek Harness EAC v1.0.lnk'),
     ]) {
       try { if (fs.existsSync(legacy)) { fs.rmSync(legacy); changed = true; } } catch {}
     }
