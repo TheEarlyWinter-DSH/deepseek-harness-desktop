@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { opendir, stat, readFile } from "node:fs/promises";
+import { opendir, stat, readFile, realpath } from "node:fs/promises";
 import { readdirSync, readFileSync } from "node:fs";
-import { isAbsolute, join, extname } from "node:path";
+import { isAbsolute, join, extname, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -101,6 +101,20 @@ function sendJson(res, status, body) {
   res.end(data);
 }
 
+async function isSessionPath(sessionId, target) {
+  const root = findSessionCwd(sessionId);
+  if (!root || !target || !isAbsolute(target)) return false;
+  try {
+    const rootPath = await realpath(root);
+    const targetPath = await realpath(target);
+    const a = process.platform === "win32" ? targetPath.toLowerCase() : targetPath;
+    const b = process.platform === "win32" ? rootPath.toLowerCase() : rootPath;
+    return a === b || a.startsWith(b + sep);
+  } catch {
+    return false;
+  }
+}
+
 /** 读一层目录：目录在前、文件在后，各自按名称排序；附带文件大小与修改时间。 */
 async function listOneLevel(dirPath) {
   const handle = await opendir(dirPath);
@@ -154,8 +168,13 @@ async function handleListRoute(req, res) {
     return;
   }
   const dirPath = (url.searchParams.get("path") || "").trim();
+  const sessionId = (url.searchParams.get("sessionId") || "").trim();
   if (!dirPath || !isAbsolute(dirPath)) {
     sendJson(res, 400, { error: "path must be an absolute path" });
+    return;
+  }
+  if (!await isSessionPath(sessionId, dirPath)) {
+    sendJson(res, 403, { error: "path outside session workspace" });
     return;
   }
   try {
@@ -199,16 +218,17 @@ function mimeFor(p) {
 
 /** 从 /dsh-files/static/<path> 的 pathname 还原绝对路径；非法/不支持返回空串。 */
 function pathFromStaticUrl(pathname) {
-  let p;
   try {
-    p = decodeURIComponent(pathname.slice(STATIC_PREFIX.length));
+    const raw = pathname.slice(STATIC_PREFIX.length);
+    const split = raw.indexOf("/");
+    if (split < 1) return null;
+    let p = decodeURIComponent(raw.slice(split + 1));
+    if (/^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1);
+    if (!isAbsolute(p)) return null;
+    return { sessionId: decodeURIComponent(raw.slice(0, split)), path: p };
   } catch {
-    return "";
+    return null;
   }
-  // 浏览器把 "//server" 折叠成 "/server"；仅恢复盘符路径（UNC 预览不支持）。
-  if (/^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1);
-  if (!isAbsolute(p)) return "";
-  return p;
 }
 
 async function handleStaticRoute(req, res) {
@@ -230,10 +250,16 @@ async function handleStaticRoute(req, res) {
     res.end();
     return;
   }
-  const p = pathFromStaticUrl(pathname);
-  if (!p) {
+  const parsed = pathFromStaticUrl(pathname);
+  if (!parsed) {
     res.writeHead(400);
     res.end("bad path");
+    return;
+  }
+  const p = parsed.path;
+  if (!await isSessionPath(parsed.sessionId, p)) {
+    res.writeHead(403);
+    res.end("forbidden");
     return;
   }
   try {
@@ -248,7 +274,9 @@ async function handleStaticRoute(req, res) {
     res.writeHead(200, {
       "content-type": TEXT_MIME.test(mime) ? mime + "; charset=utf-8" : mime,
       "content-length": String(data.length),
-      "cache-control": "no-store"
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'self' data: blob: 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'",
+      "x-content-type-options": "nosniff"
     });
     res.end(req.method === "HEAD" ? undefined : data);
   } catch (err) {
@@ -514,4 +542,4 @@ function apply(ctx) {
   return () => { for (const d of disposers) d(); };
 }
 
-export { apply, inject, name };
+export { apply, findSessionCwd, inject, name };

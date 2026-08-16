@@ -166,13 +166,13 @@ window.__ModuleLoader__.load({
 			}
 			return staticBasePromise;
 		}
-		function staticUrlForPath(p) {
+		function staticUrlForPath(sessionId, p) {
 			const segs = String(p).replace(/\\/g, "/").split("/").filter(Boolean);
-			return "/dsh-files/static/" + segs.map((s) => encodeURIComponent(s)).join("/");
+			return "/dsh-files/static/" + encodeURIComponent(sessionId) + "/" + segs.map((s) => encodeURIComponent(s)).join("/");
 		}
-		function shellStaticUrlForPath(base, p) {
+		function shellStaticUrlForPath(base, sessionId, p) {
 			const segs = String(p).replace(/\\/g, "/").split("/").filter(Boolean);
-			return base + "/" + segs.map((s) => encodeURIComponent(s)).join("/");
+			return base + "/" + encodeURIComponent(sessionId) + "/" + segs.map((s) => encodeURIComponent(s)).join("/");
 		}
 
 		/** 把用户输入规范成 URL：3000 / :3000 / localhost:3000 → http://127.0.0.1:3000/ */
@@ -241,11 +241,9 @@ window.__ModuleLoader__.load({
 					state.index = state.history.length - 1;
 				}
 				input.value = url;
-				// 同源（宿主 /dsh-files/static/ 回退）→ 去掉 sandbox 以加载相对资源；
-				// 跨源（壳层静态端口 / 端口预览）→ sandbox 隔离（跨源下
-				// allow-same-origin 无逃逸风险，页面自身 origin 保持可用）。
-				if (/^\//.test(url)) frame.removeAttribute("sandbox");
-				else frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-modals");
+				// 项目 HTML 属于不可信内容：无论走哪个预览入口都保留唯一源沙箱，
+				// 防止页面访问 DSH 同源 API、终端 WebSocket 或父窗口 DOM。
+				frame.setAttribute("sandbox", "allow-scripts allow-forms allow-modals");
 				frame.src = url;
 				setStatus("加载中… " + url);
 				checkOnline(url);
@@ -371,8 +369,10 @@ window.__ModuleLoader__.load({
 				st.filePath = meta.filePath || target;
 				st.show();
 				// 优先走壳层独立端口静态服务；取不到（非壳层环境/旧壳层）回退宿主路由。
+				const sessionId = String(meta.sessionId || "");
+				if (!sessionId) return;
 				staticBaseUrl().then((base) => {
-					st.navigate(base ? shellStaticUrlForPath(base, target) : staticUrlForPath(target));
+					st.navigate(base ? shellStaticUrlForPath(base, sessionId, target) : staticUrlForPath(sessionId, target));
 				});
 			} else {
 				st.filePath = null;
@@ -408,8 +408,8 @@ window.__ModuleLoader__.load({
 			return s.slice(0, idx);
 		}
 
-		async function fetchDirList(dir) {
-			const res = await fetch("/api/dsh-files/list?path=" + encodeURIComponent(dir));
+		async function fetchDirList(sessionId, dir) {
+			const res = await fetch("/api/dsh-files/list?sessionId=" + encodeURIComponent(sessionId) + "&path=" + encodeURIComponent(dir));
 			if (!res.ok) {
 				let msg = "HTTP " + res.status;
 				try {
@@ -422,13 +422,13 @@ window.__ModuleLoader__.load({
 			return Array.isArray(j.entries) ? j.entries : [];
 		}
 
-		function TreeRow({ path, name, dir, size, depth, changedPaths, onOpenFile }) {
+		function TreeRow({ sessionId, path, name, dir, size, depth, changedPaths, onOpenFile }) {
 			const [open, setOpen] = react.useState(false);
 			const [state, setState] = react.useState({ status: "idle", entries: null, error: null });
 			const load = react.useCallback(async () => {
 				setState((s) => ({ ...s, status: "loading" }));
 				try {
-					const entries = await fetchDirList(path);
+					const entries = await fetchDirList(sessionId, path);
 					setState({ status: "loaded", entries, error: null });
 				} catch (err) {
 					setState({ status: "error", entries: null, error: String((err && err.message) || err) });
@@ -471,7 +471,7 @@ window.__ModuleLoader__.load({
 							isHtml && react_jsx_runtime.jsx("button", {
 								className: "dsh-ft-preview",
 								title: "站内预览",
-								onClick: (e) => { e.stopPropagation(); openPreview(path, { kind: "file", filePath: path }); },
+								onClick: (e) => { e.stopPropagation(); openPreview(path, { kind: "file", filePath: path, sessionId }); },
 								children: "▶"
 							}),
 							changed && react_jsx_runtime.jsx("span", {
@@ -491,6 +491,7 @@ window.__ModuleLoader__.load({
 					}),
 					open && state.status === "loaded" && state.entries.map((e) => react_jsx_runtime.jsx(TreeRow, {
 						key: e.name,
+						sessionId,
 						path: path.replace(/[\\/]+$/, "") + "/" + e.name,
 						name: e.name,
 						dir: !!e.dir,
@@ -504,7 +505,7 @@ window.__ModuleLoader__.load({
 			});
 		}
 
-		function FileTree({ cwd, changedPaths }) {
+		function FileTree({ sessionId, cwd, changedPaths }) {
 			const [root, setRoot] = react.useState(cwd);
 			const [version, setVersion] = react.useState(0);
 			react.useEffect(() => { setRoot(cwd); }, [cwd]);
@@ -561,6 +562,7 @@ window.__ModuleLoader__.load({
 					}),
 					react_jsx_runtime.jsx(TreeRow, {
 						key: normPath(root) + "@" + version,
+						sessionId,
 						path: root.replace(/[\\/]+$/, ""),
 						name: basename(root) || root,
 						dir: true,
@@ -657,7 +659,7 @@ window.__ModuleLoader__.load({
 						]
 					}),
 					mode === "tree"
-						? react_jsx_runtime.jsx(FileTree, { cwd, changedPaths })
+						? react_jsx_runtime.jsx(FileTree, { sessionId, cwd, changedPaths })
 						: groups.length === 0
 							? react_jsx_runtime.jsxs("div", {
 									className: "dsh-fc-empty",

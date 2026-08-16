@@ -168,7 +168,7 @@ window.__ModuleLoader__.load({
 					ws = new WebSocket(
 						proto + "://" + window.location.host +
 						"/dsh-files/term/ws?token=" + encodeURIComponent(tokenRef.current) +
-						"&cwd=" + encodeURIComponent(cur)
+						"&sessionId=" + encodeURIComponent(sessionId || "")
 					);
 				} catch (err) {
 					setStatus("failed");
@@ -233,14 +233,14 @@ window.__ModuleLoader__.load({
 					retryTimerRef.current = setTimeout(() => connect(), delay);
 				};
 				ws.onerror = () => {};
-			}, [append]);
+			}, [append, sessionId]);
 
 			const restart = react.useCallback(() => {
 				intentionalRef.current = true;
 				if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
 				if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
 				const old = tokenRef.current;
-				tokenRef.current = newToken();
+				tokenRef.current = newToken(tokenKeyFor(sessionId));
 				if (old) {
 					try {
 						fetch("/dsh-files/term/close", {
@@ -255,7 +255,7 @@ window.__ModuleLoader__.load({
 				setLines([]);
 				retryDelayRef.current = 1000;
 				connect();
-			}, [connect]);
+			}, [connect, sessionId]);
 
 			react.useEffect(() => {
 				if (!cwd) return;

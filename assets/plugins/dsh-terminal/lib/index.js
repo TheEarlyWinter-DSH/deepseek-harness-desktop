@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { stat } from "node:fs/promises";
+import { findSessionCwd } from "../../dsh-file-changes/lib/index.js";
 
 // DSH Desktop 配套终端（宿主侧）：
 // 在 webServer 上提供终端路由，为「终端」标签页提供流式 shell：
@@ -36,6 +37,16 @@ const shells = new Map(); // token -> record
 function isLoopback(req) {
   const ra = req.socket && req.socket.remoteAddress;
   return ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
+}
+
+function isTrustedOrigin(req) {
+  try {
+    const origin = new URL(String(req.headers.origin || ""));
+    return origin.protocol === "http:" && origin.host === String(req.headers.host || "") &&
+      (origin.hostname === "127.0.0.1" || origin.hostname === "localhost" || origin.hostname === "[::1]");
+  } catch {
+    return false;
+  }
 }
 
 function sendJson(res, status, body) {
@@ -271,7 +282,9 @@ function handleClientMessage(rec, text) {
 
 // --- 会话查找/创建（SSE 与 WS 共用） ------------------------------------------
 
-async function ensureRecord(token, cwd) {
+async function ensureRecord(token, sessionId) {
+  const cwd = findSessionCwd(sessionId);
+  if (!cwd) return { __error: "session workspace not found" };
   let rec = token ? shells.get(token) : undefined;
   if (rec) {
     // A2：同一 token 被另一会话（不同 cwd）复用：回收旧 shell，按新 cwd 重建。
@@ -332,7 +345,7 @@ async function handleEventsRoute(req, res) {
     res.end();
     return;
   }
-  if (!isLoopback(req)) {
+  if (!isLoopback(req) || !isTrustedOrigin(req)) {
     res.writeHead(403);
     res.end("forbidden");
     return;
@@ -346,8 +359,8 @@ async function handleEventsRoute(req, res) {
     return;
   }
   const token = (url.searchParams.get("token") || "").trim();
-  const cwd = (url.searchParams.get("cwd") || "").trim();
-  const rec = await ensureRecord(token, cwd);
+  const sessionId = (url.searchParams.get("sessionId") || "").trim();
+  const rec = await ensureRecord(token, sessionId);
   if (rec.__error) {
     sendJson(res, 400, { error: rec.__error });
     return;
@@ -357,7 +370,7 @@ async function handleEventsRoute(req, res) {
 
 async function handleWsUpgrade(req, socket, head) {
   console.log("[dsh-terminal] ws request", "remote=" + (req.socket && req.socket.remoteAddress));
-  if (!isLoopback(req)) { socket.destroy(); return; }
+  if (!isLoopback(req) || !isTrustedOrigin(req)) { socket.destroy(); return; }
   const key = req.headers["sec-websocket-key"];
   if (!key) {
     socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -373,8 +386,8 @@ async function handleWsUpgrade(req, socket, head) {
     return;
   }
   const token = (url.searchParams.get("token") || "").trim();
-  const cwd = (url.searchParams.get("cwd") || "").trim();
-  const rec = await ensureRecord(token, cwd);
+  const sessionId = (url.searchParams.get("sessionId") || "").trim();
+  const rec = await ensureRecord(token, sessionId);
   if (rec.__error) {
     socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     socket.destroy();

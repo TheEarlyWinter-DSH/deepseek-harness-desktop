@@ -34,12 +34,13 @@ const zlib = require('node:zlib');
 // 任意绝对路径（如写入 Startup\*.bat）一律拒绝；缓存 5 分钟。
 // ---------------------------------------------------------------------------
 const DANGEROUS_EXT = /\.(bat|cmd|com|exe|ps1|vbs|lnk|js|jse|msi|scr|pif|reg)$/i;
-const fileRootsCache = { at: 0, roots: [] };
+const fileRootsCache = { at: 0, roots: [], bySession: new Map() };
 
-function fileRoots() {
-  if (Date.now() - fileRootsCache.at < 5 * 60 * 1000) return fileRootsCache.roots;
+function refreshFileRoots() {
+  if (Date.now() - fileRootsCache.at < 5 * 60 * 1000) return;
   const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
   const roots = [];
+  const bySession = new Map();
   const walk = (dir) => {
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
@@ -53,22 +54,35 @@ function fileRoots() {
         if (frames.length === 0) continue;
         const text = zlib.zstdDecompressSync(buf.subarray(frames[0].start, frames[0].end)).toString('utf8');
         const header = JSON.parse(text.split('\n', 1)[0]);
-        if (header && typeof header.cwd === 'string' && header.cwd) roots.push(header.cwd);
+        if (header && typeof header.cwd === 'string' && header.cwd) {
+          roots.push(header.cwd);
+          if (header.id) bySession.set(String(header.id), header.cwd);
+        }
       } catch { /* 跳过损坏日志 */ }
     }
   };
   walk(path.join(dshHome, 'sessions'));
   fileRootsCache.roots = [...new Set(roots)];
+  fileRootsCache.bySession = bySession;
   fileRootsCache.at = Date.now();
-  return fileRootsCache.roots;
+}
+
+function fileRoots() { refreshFileRoots(); return fileRootsCache.roots; }
+function fileRootForSession(sessionId) { refreshFileRoots(); return fileRootsCache.bySession.get(String(sessionId || '')) || ''; }
+
+function isUnderRoot(p, root) {
+  if (!root) return false;
+  let resolved = path.resolve(p);
+  let rootResolved = path.resolve(root);
+  try { resolved = fs.realpathSync.native(resolved); } catch {}
+  try { rootResolved = fs.realpathSync.native(rootResolved); } catch {}
+  const a = IS_WIN ? resolved.toLowerCase() : resolved;
+  const b = IS_WIN ? rootResolved.toLowerCase() : rootResolved;
+  return a === b || a.startsWith(b + path.sep);
 }
 
 function isUnderFileRoots(p) {
-  const resolved = path.resolve(p);
-  return fileRoots().some((r) => {
-    const rp = path.resolve(r);
-    return resolved === rp || resolved.startsWith(rp + path.sep);
-  });
+  return fileRoots().some((root) => isUnderRoot(p, root));
 }
 
 const IS_WIN = process.platform === 'win32';
@@ -1352,16 +1366,22 @@ function startPreviewStaticServer() {
       return;
     }
     let p;
+    let sessionId;
     try {
-      p = decodeURIComponent(new URL(req.url, "http://127.0.0.1").pathname.slice(1));
+      const raw = new URL(req.url, "http://127.0.0.1").pathname.slice(1);
+      const split = raw.indexOf("/");
+      if (split < 1) throw new Error("missing session");
+      sessionId = decodeURIComponent(raw.slice(0, split));
+      p = decodeURIComponent(raw.slice(split + 1));
     } catch {
       res.writeHead(400);
       res.end();
       return;
     }
     if (/^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1);
-    if (!path.isAbsolute(p)) {
-      res.writeHead(400);
+    const root = fileRootForSession(sessionId);
+    if (!path.isAbsolute(p) || !isUnderRoot(p, root)) {
+      res.writeHead(403);
       res.end();
       return;
     }
@@ -1376,7 +1396,9 @@ function startPreviewStaticServer() {
       res.writeHead(200, {
         "content-type": TEXT_MIME.test(mime) ? mime + "; charset=utf-8" : mime,
         "content-length": String(st.size),
-        "cache-control": "no-store"
+        "cache-control": "no-store",
+        "content-security-policy": "default-src 'self' data: blob: 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'",
+        "x-content-type-options": "nosniff"
       });
       if (req.method === "HEAD") { res.end(); return; }
       fs.createReadStream(p).pipe(res);
