@@ -1,7 +1,12 @@
 # DeepSeek Harness Desktop
 
-把官方 [@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）封装成开箱即用、轻量纯粹的 Windows 专属桌面客户端。
+官方 [@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）的零配置 Windows 桌面发行版：内置运行时、桌面工作流与配套插件，双击即可进入本地 Coding Agent 工作台。
 
+![DeepSeek Harness Desktop v2.3 工作区](docs/screenshots/v2.3-workspace.png)
+
+- ✅ **首次启动向导**：检测 DSH 内核、默认模型与凭据状态，集中设置新会话默认权限、通知和托盘偏好
+- ✅ **三档权限模式**：支持只读、工作区写入与完全访问；向导设置新会话默认值，会话内仍可用 DSH 原生控件独立切换
+- ✅ **版本与诊断**：统一展示桌面端/内核/Overlay 版本、服务状态、运行路径与日志位置，支持一键复制脱敏诊断信息
 - ✅ **免安装 Node**：内置独立的 Node 运行时与 npm CLI，目标机器无需安装 Node.js
 - ✅ **内置 dsh CLI**：完整打包 `@deepseek-ai/dsh` 及其核心组件，离线可用
 - ✅ **一键启动**：双击即启动 `dsh web`，自动挑选空闲端口，就绪后加载到原生窗口
@@ -19,7 +24,19 @@
 - ✅ **界面皮肤切换**：设置页「皮肤」标签页内置多款精美 Web UI 皮肤，互斥切换、重启生效
 - ✅ **📊 交互式卡片渲染**：模型输出 `<dsh-card>` 或架构/图表代码时，内联以独立磨砂沙箱卡片自适应渲染，支持一键重绘、复制代码与弹出预览
 - ✅ **🧰 标准化 SKILL.md 技能体系**：支持 `~/.dsh/skills` 开放技能规范，内置代码评审、TDD、架构图表等开箱即用技能
-- ✅ **极简纯粹**：剔除冗余插件，专注高效编程与纯净体验
+- ✅ **专注 DSH 工作流**：围绕 DeepSeek Harness 的安装、配置、执行、审查、恢复和诊断提供完整桌面体验
+
+## 首次使用
+
+![DeepSeek Harness Desktop v2.3 首次启动向导](docs/screenshots/v2.3-first-run.png)
+
+1. 启动应用，等待本地 DSH Web UI 就绪。
+2. 首次向导会检查内核、模型和凭据配置状态。
+3. 选择新会话默认权限：日常使用建议选择「工作区写入」。
+4. 若模型或凭据尚未配置，请进入 DSH 设置页完成 Provider、API Key 与默认模型设置。
+5. 以后可从标题栏 `⋯` 菜单重新打开「首次设置与默认权限」或「版本与诊断」。
+
+> 桌面向导只检测凭据文件是否存在，不读取或展示 API Key 内容。权限默认值写入 DSH 自身的 `settings.yaml`，与 CLI 共享。
 
 ## 快速运行与构建
 

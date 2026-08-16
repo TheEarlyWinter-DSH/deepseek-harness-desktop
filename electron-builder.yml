@@ -23,6 +23,7 @@ files:
   - patch-row-heal.js
   - preset-sync.js
   - skill-sync.js
+  - settings-yaml.js
   - preload.js
   - assets/**/*
   - package.json

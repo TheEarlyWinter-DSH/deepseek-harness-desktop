@@ -38,6 +38,11 @@ const dshDesktop = {
     action: (action, payload) => ipcRenderer.invoke('chrome:menu', { action, ...payload }),
   },
   getInfo: () => ipcRenderer.invoke('chrome:init'),
+  setup: {
+    get: () => ipcRenderer.invoke('chrome:setup', { action: 'get' }),
+    save: (payload) => ipcRenderer.invoke('chrome:setup', { action: 'save', ...payload }),
+  },
+  diagnostics: () => ipcRenderer.invoke('chrome:diagnostics'),
   // 插件市场：请求主进程原地重启 dsh web 服务（安装/卸载插件后生效）。
   restartService: () => ipcRenderer.invoke('chrome:restart-service', { intent: 'restart-service' }),
   // 「文件」视图的还原请求：changes = [{path, op, oldText, newText}]（逆序）。
@@ -134,6 +139,8 @@ function renderMenu() {
       <div class="dch-mh-title">DeepSeek Harness <span style="font-weight:400;color:var(--dsw-alias-label-tertiary)">v${esc(state.appVersion)}</span></div>
       <div class="dch-mh-sub"><span>内核 agent v${esc(state.agentVersion)}</span><span>${esc(state.agentSource)}</span></div>
     </div>
+    <button class="dch-item" data-act="open-setup">首次设置与默认权限…</button>
+    <button class="dch-item" data-act="open-diagnostics">版本与诊断…</button>
     <button class="dch-item" data-act="check-agent-update">检查内核 dsh 更新…</button>
     <button class="dch-item" data-act="toggle-notify"><span>会话完成通知</span>${state.notifyOnTurnEnd ? '<span class="dch-check">✓</span>' : ''}</button>
     <button class="dch-item" data-act="toggle-close-to-tray"><span>关闭时最小化到托盘</span>${state.closeToTray ? '<span class="dch-check">✓</span>' : ''}</button>
@@ -157,6 +164,12 @@ function renderMenu() {
         return;
       }
       closeMenu();
+      if (act === 'open-setup' || act === 'open-diagnostics') {
+        window.dispatchEvent(new CustomEvent('dsh-desktop-open-panel', {
+          detail: act === 'open-setup' ? 'setup' : 'diagnostics',
+        }));
+        return;
+      }
       dshDesktop.menu.action(act);
     });
   });

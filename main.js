@@ -26,6 +26,7 @@ const { healProfileModuleShadowing, healCustomModelReasoning } = require('./prof
 const { configLinesFor, removeBundledRowDuplicates, removePluginRows } = require('./patch-row-heal');
 const { syncBundledPresets, ensureDefaultAgentPreset } = require('./preset-sync');
 const { syncBundledSkills } = require('./skill-sync');
+const { readSettingsScalar, writeSettingsScalar } = require('./settings-yaml');
 const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
 const zlib = require('node:zlib');
 
@@ -660,10 +661,59 @@ function setCloseToTray(v) {
   updater.saveSettings(updCtx(), s);
 }
 
+const PERMISSION_PRESETS = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+
+function effectiveDshHome() {
+  return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+}
+
+function setupSnapshot() {
+  const s = updater.loadSettings(updCtx());
+  const home = effectiveDshHome();
+  const credentialsPath = path.join(home, '.credentials.yaml');
+  const settingsFile = path.join(home, 'settings.yaml');
+  const defaultModel = readSettingsScalar(settingsFile, 'agent-default-model', 'model', '');
+  return {
+    completed: s.setupCompleted === true,
+    agentVersion: dshVersion(),
+    permissionPreset: readSettingsScalar(settingsFile, 'permission', 'defaultPreset', 'workspace-write'),
+    notifyOnTurnEnd: s.notifyOnTurnEnd !== false,
+    closeToTray: s.closeToTray !== false,
+    credentialsConfigured: fs.existsSync(credentialsPath) && fs.statSync(credentialsPath).size > 0,
+    modelConfigured: !!defaultModel,
+    defaultModel,
+  };
+}
+
+function diagnosticsSnapshot() {
+  const home = effectiveDshHome();
+  const overlay = updater.overlayVersion(updCtx());
+  return {
+    appVersion: APP_VERSION,
+    agentVersion: dshVersion(),
+    agentSource: dshVersionSource(),
+    permissionPreset: readSettingsScalar(path.join(home, 'settings.yaml'), 'permission', 'defaultPreset', 'workspace-write'),
+    packaged: app.isPackaged,
+    platform: process.platform + '-' + process.arch,
+    runtime: process.version,
+    serverRunning: !!(serverProc && serverProc.pid),
+    serverPid: serverProc?.pid || null,
+    webUrl: webUrl || '',
+    userDataDir,
+    dshHome: home,
+    settingsPath: path.join(home, 'settings.yaml'),
+    logsDir,
+    overlayVersion: overlay || '',
+    bundledVersion: updater.bundledVersion() || '',
+  };
+}
+
 function repoUrls() {
   return {
     github: 'https://github.com/deepseek-ai/deepseek-harness',
     gitee: '',
+    desktop: 'https://github.com/TheEarlyWinter/deepseek-harness-desktop',
+    upstream: 'https://github.com/deepseek-ai/deepseek-harness',
   };
 }
 
@@ -698,7 +748,48 @@ function registerChromeIpc() {
       iconDataUri,
       repoUrls: urls,
       staticPort: previewStaticPort,
+      setup: setupSnapshot(),
     };
+  });
+
+  ipcMain.handle('chrome:setup', async (event, payload = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    if (payload.action === 'get') return { ok: true, setup: setupSnapshot() };
+    if (payload.action !== 'save' || !PERMISSION_PRESETS.has(payload.permissionPreset)) {
+      return { ok: false, error: 'invalid setup payload' };
+    }
+    try {
+      if (payload.permissionPreset === 'danger-full-access') {
+        const result = await showBox({
+          type: 'warning',
+          title: '确认完全访问权限',
+          message: '将新会话默认权限改为“完全访问”？',
+          detail: '此模式允许 Agent 修改工作区之外的文件，并且不会弹出批准请求。只有在你理解风险并信任任务时才应启用。',
+          buttons: ['取消', '确认启用'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        });
+        if (result.response !== 1) return { ok: false, error: 'cancelled' };
+      }
+      const settingsFile = path.join(effectiveDshHome(), 'settings.yaml');
+      fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
+      writeSettingsScalar(settingsFile, 'permission', 'defaultPreset', payload.permissionPreset);
+      const s = updater.loadSettings(updCtx());
+      s.setupCompleted = true;
+      s.notifyOnTurnEnd = payload.notifyOnTurnEnd !== false;
+      s.closeToTray = payload.closeToTray !== false;
+      updater.saveSettings(updCtx(), s);
+      notifyOnTurnEnd = s.notifyOnTurnEnd;
+      return { ok: true, setup: setupSnapshot(), restartRecommended: true };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  ipcMain.handle('chrome:diagnostics', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return null;
+    return diagnosticsSnapshot();
   });
 
   ipcMain.handle('chrome:window', (event, { action } = {}) => {
@@ -919,6 +1010,7 @@ function createTray() {
 // ---------------------------------------------------------------------------
 
 const COMPANION_PLUGINS = [
+  { id: 'desktop-control', name: '@deepseek-ai/dsh-desktop-control' },
   { id: 'file-changes', name: '@deepseek-ai/dsh-file-changes' },
   { id: 'client-file-changes', name: '@deepseek-ai/dsh-client-file-changes' },
   { id: 'terminal', name: '@deepseek-ai/dsh-terminal' },
