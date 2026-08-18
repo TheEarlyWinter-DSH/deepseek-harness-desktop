@@ -6,6 +6,11 @@
 
 - ✅ **首次启动向导**：检测 DSH 内核、默认模型与凭据状态，集中设置新会话默认权限、通知和托盘偏好
 - ✅ **三档权限模式**：支持只读、工作区写入与完全访问；向导设置新会话默认值，会话内仍可用 DSH 原生控件独立切换
+- ✅ **双自愈韧性防护**：启动前自动递归校验插件入口并自愈配置（`patch-row-heal`）；运行时多级防白屏崩溃自愈（`renderer-recovery` 指数退避 + 窗口重建 + 本地错误恢复页 + 看门狗）
+- ✅ **实时费用与余额监控**：支持 DeepSeek 官方 API 余额查询，深度适配 2026 官方峰谷分时电价换算，并支持 OpenCode Go 订阅配额监控（`balance.js`）
+- ✅ **会话监视器 v2**：采用 `fs.watch` 事件驱动增量 zstd 解析与损坏帧容错滑动窗口，稳态 CPU 占用暴降 75%，任务完成毫秒级通知
+- ✅ **客户端双源自更新**：支持 GitHub / Gitee 双源在线检查与一键升级，便携版支持进程外原地热替换，自动感知企业代理
+- ✅ **插件安全防护与快照回滚**：插件安装前自动创建配置快照，内置静态木马模式扫描拦截，支持一键秒级回滚（`plugin-guard.js`）
 - ✅ **版本与诊断**：统一展示桌面端/内核/Overlay 版本、服务状态、运行路径与日志位置，支持一键复制脱敏诊断信息
 - ✅ **免安装 Node**：内置独立的 Node 运行时与 npm CLI，目标机器无需安装 Node.js
 - ✅ **内置 dsh CLI**：完整打包 `@deepseek-ai/dsh` 及其核心组件，离线可用
@@ -98,15 +103,23 @@ npm run dist
 dsh-desktop/
 ├── main.js               # Electron 主进程（窗口、托盘、自绘标题栏 IPC、快捷方式维护）
 ├── updater.js            # @deepseek-ai/dsh 官方内核更新引擎（npm view 检查 / overlay 安装）
-├── session-watcher.js    # 会话完成监听（zstd 多帧解码 + turn/end 检测）
-├── preload.js            # 预加载脚本（自绘玻璃标题栏、窗口控制、菜单 IPC）
+├── client-updater.js     # 客户端自更新引擎（GitHub/Gitee 双源、便携版原地替换、代理感知）
+├── session-watcher.js    # 会话完成监听 v2（fs.watch 事件驱动 + zstd 增量多帧解码 + 损坏容错）
+├── balance.js            # 实时费用与账户余额查询（2026 峰谷分时电价 + OpenCode 订阅额度）
+├── renderer-recovery.js  # 渲染进程崩溃自愈状态机（防白屏、指数退避、窗口重建、本地错误页）
+├── watchdog.js           # 独立轻量看门狗进程（异常退出守护）
+├── plugin-guard.js       # 插件安全保护中心（配置快照备份、木马正则体检、一键秒级回滚）
+├── preload.js            # 预加载脚本（自绘玻璃标题栏、窗口控制、菜单 IPC 与桥接）
 ├── preset-sync.js        # 预设同步与初始化
 ├── profile-module-heal.js# 模块阴影修复与环境自愈
-├── patch-row-heal.js     # profile patch 配置管理与插件行维护
-├── assets/               # 静态资源、加载动画、图标、配套插件
+├── patch-row-heal.js     # profile patch 配置管理与插件入口完整性自愈
+├── landing/              # 官方宣发落地页（暗黑玻璃风单页）
+├── assets/               # 静态资源、加载与恢复页面、图标、配套插件
 │   ├── icon.ico          # 多分辨率专属 Windows 图标
+│   ├── loading.html      # 启动加载过渡页
+│   ├── recovery.html     # 本地故障恢复诊断页
 │   ├── plugins/          # 核心配套插件（文件追踪、终端、皮肤切换、移动端修复等）
-│   └── skins/            # 内置主题皮肤包
+│   └── skins/            # 内置 5 款主题皮肤包（XP / Miku / 98 / Trading / THS）
 ├── scripts/
 │   ├── fetch-node.js     # 内置 node.exe 拉取与复制
 │   ├── fetch-npm.js      # 内置 npm CLI 拉取与复制

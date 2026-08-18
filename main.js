@@ -28,6 +28,10 @@ const { syncBundledPresets, ensureDefaultAgentPreset } = require('./preset-sync'
 const { syncBundledSkills } = require('./skill-sync');
 const { readSettingsScalar, writeSettingsScalar } = require('./settings-yaml');
 const { SessionWatcher, scanZstdFrames } = require('./session-watcher');
+const balance = require('./balance');
+const { RendererRecovery } = require('./renderer-recovery');
+const clientUpdater = require('./client-updater');
+const { createGuard } = require('./plugin-guard');
 const zlib = require('node:zlib');
 
 // ---------------------------------------------------------------------------
@@ -358,6 +362,40 @@ function handleBootFailure(err) {
 // Window
 // ---------------------------------------------------------------------------
 
+let recovery = null;
+
+function getWindowRecovery() {
+  if (recovery) return recovery;
+  recovery = new RendererRecovery({
+    log,
+    isQuitting: () => forceQuit,
+    isServerAlive: () => !!serverProc,
+    getTarget: (win) => {
+      if (webUrl) return { kind: 'url', url: webUrl };
+      return { kind: 'file', path: path.join(__dirname, 'assets', 'loading.html') };
+    },
+    loadingPage: path.join(__dirname, 'assets', 'loading.html'),
+    recoveryPage: path.join(__dirname, 'assets', 'recovery.html'),
+    rebuildMainWindow: () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+      createWindow();
+      return mainWindow;
+    },
+    waitServerUp: async (maxMs) => {
+      if (!serverProc || !webPort) throw new Error('server not running');
+      await waitHttp('http://127.0.0.1:' + webPort, maxMs);
+    },
+    notify: (title, body) => {
+      try {
+        if (Notification.isSupported()) {
+          new Notification({ title, body }).show();
+        }
+      } catch {}
+    },
+  });
+  return recovery;
+}
+
 function createWindow() {
   const icoPath = path.join(__dirname, 'assets', 'icon.ico');
   const pngPath = path.join(__dirname, 'assets', 'icon.png');
@@ -381,6 +419,9 @@ function createWindow() {
       spellcheck: false,
     },
   });
+
+  const rec = getWindowRecovery();
+  rec.attach(mainWindow, 'main');
 
   mainWindow.loadFile(path.join(__dirname, 'assets', 'loading.html'));
   mainWindow.once('ready-to-show', () => {
@@ -944,6 +985,108 @@ function registerChromeIpc() {
       return { ok: true };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  // 账户余额与订阅额度监控
+  ipcMain.handle('dsh:balance-refresh', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return null;
+    const home = effectiveDshHome();
+    const [bal, opencode] = await Promise.all([
+      balance.queryBalance(home),
+      balance.queryOpencodeUsage(home),
+    ]);
+    const model = balance.readActiveModel(home) || 'deepseek-v4-pro';
+    const prices = balance.effectivePrice(model);
+    return {
+      balance: bal,
+      opencode,
+      prices,
+      model,
+      isPeak: balance.isPeakHour(),
+    };
+  });
+
+  // 界面恢复状态与操作
+  ipcMain.handle('chrome:recovery-state', (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return null;
+    return {
+      appVersion: APP_VERSION,
+      state: recovery ? recovery.stateOf(mainWindow) : null,
+      logsDir,
+      crashDumpsDir: app.getPath('crashDumps'),
+    };
+  });
+
+  ipcMain.handle('chrome:recovery-reload', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false };
+    if (recovery) {
+      recovery.retryNow(mainWindow);
+      return { ok: true };
+    }
+    mainWindow.reload();
+    return { ok: true };
+  });
+
+  ipcMain.handle('chrome:recovery-restart', (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    app.relaunch();
+    app.exit(0);
+  });
+
+  ipcMain.handle('chrome:recovery-open-logs', (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    shell.openPath(logsDir);
+  });
+
+  // 客户端自更新
+  ipcMain.handle('dsh:client-update-check', async (event) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    try {
+      const rel = await clientUpdater.checkLatest({ userDataDir, log }, APP_VERSION);
+      return { ok: true, release: rel };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  ipcMain.handle('dsh:client-update-download', async (event, { release } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    try {
+      const res = await clientUpdater.downloadRelease({ userDataDir, log }, release);
+      return { ok: true, pending: { path: res.filePath, version: release.version } };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  ipcMain.handle('dsh:client-update-apply', async (event, { pending } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    try {
+      clientUpdater.applyUpdate({ userDataDir, log }, pending);
+      forceQuit = true;
+      app.quit();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  // 插件安全与快照回滚
+  ipcMain.handle('guard:action', async (event, { action, value } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'forbidden' };
+    const guard = createGuard({
+      getHome: () => effectiveDshHome(),
+      getProfile: () => 'web',
+      dshBin: () => dshBinPath(),
+      log,
+    });
+    switch (action) {
+      case 'healthcheck': return { ok: true, check: guard.healthCheck() };
+      case 'snapshots': return { ok: true, snapshots: guard.listSnapshots() };
+      case 'snapshot': return { ok: true, snapshot: guard.snapshot(value || 'manual') };
+      case 'restore': return guard.restore(value);
+      default: return { ok: false, error: 'unknown guard action' };
     }
   });
 }

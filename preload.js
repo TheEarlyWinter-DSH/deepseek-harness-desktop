@@ -43,6 +43,21 @@ const dshDesktop = {
     save: (payload) => ipcRenderer.invoke('chrome:setup', { action: 'save', ...payload }),
   },
   diagnostics: () => ipcRenderer.invoke('chrome:diagnostics'),
+  refreshBalance: () => ipcRenderer.invoke('dsh:balance-refresh'),
+  recovery: {
+    getState: () => ipcRenderer.invoke('chrome:recovery-state'),
+    reload: () => ipcRenderer.invoke('chrome:recovery-reload'),
+    restart: () => ipcRenderer.invoke('chrome:recovery-restart'),
+    openLogs: () => ipcRenderer.invoke('chrome:recovery-open-logs'),
+  },
+  clientUpdater: {
+    check: () => ipcRenderer.invoke('dsh:client-update-check'),
+    download: (rel) => ipcRenderer.invoke('dsh:client-update-download', { release: rel }),
+    apply: (pending) => ipcRenderer.invoke('dsh:client-update-apply', { pending }),
+  },
+  guard: {
+    action: (action, value) => ipcRenderer.invoke('guard:action', { action, value }),
+  },
   // 插件市场：请求主进程原地重启 dsh web 服务（安装/卸载插件后生效）。
   restartService: () => ipcRenderer.invoke('chrome:restart-service', { intent: 'restart-service' }),
   // 「文件」视图的还原请求：changes = [{path, op, oldText, newText}]（逆序）。
