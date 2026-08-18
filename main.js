@@ -1283,15 +1283,15 @@ function syncCompanionPlugins() {
     let patch = '';
     try { patch = fs.readFileSync(patchFile, 'utf8'); } catch { patch = ''; }
     let changed = false;
-    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory / bridge-remote / artifacts / status-rotator / usage-skill）
-    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory', 'bridge-remote', 'artifacts', 'status-rotator', 'usage-skill'];
+    // 清理已移除的插件（balance / easy-setup / tool-vision / soul-md / tdai-memory / bridge-remote / artifacts）
+    const removedPluginIds = ['balance', 'easy-setup', 'tool-vision', 'soul-md', 'tdai-memory', 'bridge-remote', 'artifacts'];
     const purged = removePluginRows(patch, removedPluginIds);
     if (purged.removed.length) {
       patch = purged.patch;
       changed = true;
       log('boot', '已从 profile patch 移除已剔除插件: ' + purged.removed.join(', '));
     }
-    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory', '@deepseek-ai/dsh-bridge-remote', '@deepseek-ai/dsh-artifacts', 'dsh-status-rotator', 'dsh-usage-skill'];
+    const removedDirs = ['@deepseek-ai/dsh-balance', 'dsh-easy-setup', 'dsh-tool-vision', 'dsh-soul-md', 'dsh-tdai-memory', '@deepseek-ai/dsh-bridge-remote', '@deepseek-ai/dsh-artifacts'];
     for (const rdir of removedDirs) {
       const p = path.join(profileDirP, 'node_modules', ...rdir.split('/'));
       if (fs.existsSync(p)) {
@@ -1330,7 +1330,8 @@ function syncCompanionPlugins() {
     // 自愈检查：若 patch 中有未标记 disabled 的插件在 node_modules 缺失入口模块，
     // 自动置为 disabled: true，彻底防止 "Cannot find module ... (loader entries failed to apply)" 启动白屏崩溃循环。
     const fallbackModulesDir = path.join(home, 'profiles', 'node_modules');
-    const healed = healBrokenPatchEntries(profileDirP, patch, fallbackModulesDir, (m) => log('boot', m));
+    const extraSearchDirs = [path.join(home), path.join(__dirname)];
+    const healed = healBrokenPatchEntries(profileDirP, patch, fallbackModulesDir, (m) => log('boot', m), extraSearchDirs);
     if (healed.disabled.length) {
       patch = healed.patch;
       changed = true;

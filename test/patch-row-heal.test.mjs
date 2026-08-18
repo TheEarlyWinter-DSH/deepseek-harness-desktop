@@ -129,3 +129,45 @@ test('healBrokenPatchEntries: 自动将缺失入口文件的插件标记为 disa
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+test('healBrokenPatchEntries: 带 config 块与 exports 条件导出的稳健处理', async () => {
+  const patch = [
+    '- insert:',
+    '    - id: exports-plugin',
+    "      name: 'exports-plugin'",
+    '- insert:',
+    '    - id: broken-with-config',
+    "      name: 'broken-with-config'",
+    '      disabled: false',
+    '      config:',
+    '        token: "123"',
+    '',
+  ].join('\n');
+
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const tmp = fs.mkdtempSync(join(os.tmpdir(), 'patch-heal-test2-'));
+  const modulesDir = join(tmp, 'node_modules');
+
+  // exports-plugin uses modern conditional exports
+  fs.mkdirSync(join(modulesDir, 'exports-plugin', 'dist'), { recursive: true });
+  fs.writeFileSync(join(modulesDir, 'exports-plugin', 'dist', 'index.mjs'), 'export default {}');
+  fs.writeFileSync(join(modulesDir, 'exports-plugin', 'package.json'), JSON.stringify({
+    name: 'exports-plugin',
+    exports: { '.': { import: './dist/index.mjs' } }
+  }));
+
+  // broken-with-config has no files
+  fs.mkdirSync(join(modulesDir, 'broken-with-config'), { recursive: true });
+
+  const { patch: out, disabled } = healBrokenPatchEntries(tmp, patch, null);
+  assert.equal(disabled.length, 1);
+  assert.equal(disabled[0].id, 'broken-with-config');
+  // disabled: true is placed correctly, disabled: false is replaced, config is preserved
+  assert.match(out, /id: broken-with-config\s*\n\s*name: 'broken-with-config'\s*\n\s*disabled: true\s*\n\s*config:\s*\n\s*token: "123"/);
+  assert.doesNotMatch(out, /disabled: false/);
+  assert.doesNotMatch(out, /id: exports-plugin\s*\n\s*name: 'exports-plugin'\s*\n\s*disabled: true/);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+
