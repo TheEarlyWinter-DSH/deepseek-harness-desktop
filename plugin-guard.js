@@ -19,18 +19,19 @@ const SCAN_MAX_FILE_BYTES = 2 * 1024 * 1024;
 const SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 const SCAN_EXTS = /\.(c?js|mjs|cjs|json|yml|yaml|sh|ps1|bat|cmd)$/i;
 
-function createGuard(opts) {
+function createGuard(opts = {}) {
   const {
-    getHome,
-    getProfile,
+    getHome = () => path.join(require('node:os').homedir(), '.dsh'),
+    getProfile = () => 'web',
     dshBin,
     log = () => {},
   } = opts;
 
-  const home = () => getHome() || path.join(require('node:os').homedir(), '.dsh');
-  const profileDir = () => path.join(home(), 'profiles', getProfile());
+  const home = () => (typeof getHome === 'function' ? getHome() : getHome) || path.join(require('node:os').homedir(), '.dsh');
+  const profileName = () => (typeof getProfile === 'function' ? getProfile() : (getProfile || 'web'));
+  const profileDir = () => path.join(home(), 'profiles', profileName());
   const guardDir = () => path.join(home(), 'guard');
-  const rollbacksDir = () => path.join(home(), 'rollbacks', getProfile());
+  const rollbacksDir = () => path.join(home(), 'rollbacks', profileName());
   const stateFile = () => path.join(guardDir(), 'state.json');
   const incidentsDir = () => path.join(guardDir(), 'incidents');
 
