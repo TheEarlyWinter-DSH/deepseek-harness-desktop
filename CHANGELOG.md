@@ -3,6 +3,12 @@
 DeepSeek Harness（dsh）的零配置 Windows 桌面发行版：内置独立 Node 运行时、
 dsh CLI、桌面工作流与配套插件。
 
+## [2.5.0] — 2026-08-18
+
+### 新增功能
+- **独立会话分屏浮窗（Float Window）**：支持将单个会话弹出为无边框轻量浮窗（`chrome:float-window`），使用独立 session partition（`persist:dsh-float`）隔离 UI 状态与 localStorage，并内置优雅无边框迷你拖拽栏（`FLOAT_BAR`），支持最多 8 个多会话并排与分屏对照。
+- **全量配置备份与原子恢复（Desktop Backup & Restore）**：新增 `desktop-backup.js` 模块与 `dsh:backup-export` / `dsh:backup-restore` IPC 契约，支持将 profile 与全局配置完整打包为防逃逸 JSON 文件；恢复时具备符号链接安全防写穿、两阶段令牌校验与自动回滚快照保护机制。
+
 ## [2.4.0] — 2026-08-18
 
 ### 新增与核心升级

@@ -21,6 +21,7 @@ files:
   - client-updater.js
   - session-watcher.js
   - balance.js
+  - desktop-backup.js
   - renderer-recovery.js
   - watchdog.js
   - plugin-guard.js

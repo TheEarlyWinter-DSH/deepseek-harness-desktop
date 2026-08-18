@@ -15,6 +15,12 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 const BAR_ID = '__dsh_desktop_chrome__';
 const BAR_HEIGHT = 36;
+const FLOAT_BAR_ID = '__dsh_desktop_floatbar__';
+const FLOAT_BAR_HEIGHT = 24;
+
+const FLOAT_ARG = process.argv.find((a) => a.startsWith('--dsh-float='));
+const FLOAT_MODE = !!FLOAT_ARG;
+const FLOAT_SESSION = FLOAT_MODE ? FLOAT_ARG.split('=')[1] : null;
 
 // ---------------------------------------------------------------------------
 // Bridge (always exposed; the balance plugin reads it, the web UI keeps the
@@ -44,6 +50,15 @@ const dshDesktop = {
   },
   diagnostics: () => ipcRenderer.invoke('chrome:diagnostics'),
   refreshBalance: () => ipcRenderer.invoke('dsh:balance-refresh'),
+  floatWindow: {
+    open: (sessionId) => ipcRenderer.invoke('chrome:float-window', { action: 'open', sessionId }),
+    close: () => ipcRenderer.send('float:close'),
+  },
+  backup: {
+    export: (label) => ipcRenderer.invoke('dsh:backup-export', { label }),
+    restorePreview: () => ipcRenderer.invoke('dsh:backup-restore', { preview: true }),
+    restoreConfirm: (token) => ipcRenderer.invoke('dsh:backup-restore', { token }),
+  },
   recovery: {
     getState: () => ipcRenderer.invoke('chrome:recovery-state'),
     reload: () => ipcRenderer.invoke('chrome:recovery-reload'),
@@ -216,7 +231,34 @@ function setMaximized(isMax) {
   maxBtn.setAttribute('aria-label', maxBtn.title);
 }
 
+function injectFloatBar() {
+  if (document.getElementById(FLOAT_BAR_ID)) return;
+  const style = document.createElement('style');
+  style.textContent = `
+  #${FLOAT_BAR_ID}{position:fixed;top:0;left:0;right:0;height:${FLOAT_BAR_HEIGHT}px;z-index:2147483000;
+    display:flex;align-items:center;justify-content:flex-end;gap:2px;padding:0 6px 0 10px;
+    -webkit-app-region:drag;user-select:none;box-sizing:border-box;
+    background:color-mix(in srgb,var(--dsw-alias-bg-base,#0b1220) 70%,transparent);
+    border-bottom:1px solid color-mix(in srgb,var(--dsw-alias-border-l1,rgba(255,255,255,.09)) 50%,transparent)}
+  #${FLOAT_BAR_ID} button{width:26px;height:22px;display:grid;place-items:center;border:none;border-radius:7px;
+    background:transparent;color:var(--dsw-alias-label-secondary,#b8c5ea);cursor:pointer;padding:0;
+    -webkit-app-region:no-drag;outline:none;transition:background .12s,color .12s}
+  #${FLOAT_BAR_ID} button:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.09));
+    color:var(--dsw-alias-label-primary,#eef2ff)}
+  #${FLOAT_BAR_ID} button.df-close:hover{background:#e81123;color:#fff}`;
+  document.head.appendChild(style);
+  const layout = document.createElement('style');
+  layout.textContent = `body{box-sizing:border-box!important;padding-top:${FLOAT_BAR_HEIGHT}px!important}`;
+  document.head.appendChild(layout);
+  const bar = document.createElement('div');
+  bar.id = FLOAT_BAR_ID;
+  bar.innerHTML = `<button class="df-close" title="关闭" aria-label="关闭">${GLYPHS.close}</button>`;
+  document.body.appendChild(bar);
+  bar.querySelector('.df-close').addEventListener('click', () => dshDesktop.floatWindow.close());
+}
+
 function injectChrome() {
+  if (FLOAT_MODE) { injectFloatBar(); return; }
   if (document.getElementById(BAR_ID)) return;
   const style = document.createElement('style');
   style.textContent = CHROME_CSS;

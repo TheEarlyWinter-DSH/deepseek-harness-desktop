@@ -32,6 +32,7 @@ const balance = require('./balance');
 const { RendererRecovery } = require('./renderer-recovery');
 const clientUpdater = require('./client-updater');
 const { createGuard } = require('./plugin-guard');
+const desktopBackup = require('./desktop-backup');
 const zlib = require('node:zlib');
 
 // ---------------------------------------------------------------------------
@@ -361,6 +362,64 @@ function handleBootFailure(err) {
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
+
+const FLOAT_MAX = 8;
+const floatWindows = new Set();
+const floatBySession = new Map();
+
+function createFloatWindow(sessionId, { title } = {}) {
+  if (!webUrl || floatWindows.size >= FLOAT_MAX) return null;
+  const win = new BrowserWindow({
+    width: 900,
+    height: 640,
+    minWidth: 480,
+    minHeight: 360,
+    show: false,
+    title: title || 'DeepSeek Harness 会话',
+    backgroundColor: '#0b1220',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
+    ...(IS_WIN ? { frame: false, roundedCorners: true } : {}),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      spellcheck: false,
+      partition: 'persist:dsh-float',
+      additionalArguments: ['--dsh-float=' + sessionId],
+    },
+  });
+  floatWindows.add(win);
+  floatBySession.set(sessionId, win);
+  win.loadURL(webUrl).catch((err) => log('float', '浮窗加载失败: ' + ((err && err.message) || err)));
+
+  win.on('page-title-updated', (event) => {
+    event.preventDefault();
+    const raw = String(event.title || win.getTitle() || '');
+    const cleaned = raw.replace(/^DSH[·\-—\s/]*/i, '').trim();
+    win.setTitle(cleaned || 'DeepSeek Harness 会话');
+  });
+
+  win.once('ready-to-show', () => { if (!win.isDestroyed()) win.show(); });
+  win.on('closed', () => {
+    floatWindows.delete(win);
+    for (const [sid, w] of floatBySession) {
+      if (w === win) { floatBySession.delete(sid); break; }
+    }
+  });
+  if (recovery) recovery.attach(win, 'float');
+
+  log('float', '已创建会话浮窗 sessionId=' + sessionId);
+  return win;
+}
+
+function closeAllFloatWindows() {
+  for (const win of floatWindows) {
+    if (!win.isDestroyed()) win.destroy();
+  }
+  floatWindows.clear();
+  floatBySession.clear();
+}
 
 let recovery = null;
 
@@ -1087,6 +1146,118 @@ function registerChromeIpc() {
       case 'snapshot': return { ok: true, snapshot: guard.snapshot(value || 'manual') };
       case 'restore': return guard.restore(value);
       default: return { ok: false, error: 'unknown guard action' };
+    }
+  });
+
+  // 独立会话分屏浮窗
+  ipcMain.handle('chrome:float-window', (event, { action, sessionId } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'unauthorized' };
+    if (action !== 'open') return { ok: false, error: 'bad-action' };
+    if (!webUrl) return { ok: false, error: 'not-ready' };
+    if (typeof sessionId !== 'string' || !sessionId) return { ok: false, error: 'bad-session' };
+    const existing = floatBySession.get(sessionId);
+    if (existing && !existing.isDestroyed()) {
+      if (existing.isMinimized()) existing.restore();
+      existing.show();
+      existing.focus();
+      return { ok: true, id: existing.id, reused: true };
+    }
+    if (existing) floatBySession.delete(sessionId);
+    if (floatWindows.size >= FLOAT_MAX) return { ok: false, error: 'too-many' };
+    const win = createFloatWindow(sessionId);
+    if (!win) return { ok: false, error: 'too-many' };
+    return { ok: true, id: win.id };
+  });
+
+  ipcMain.on('float:close', (event) => {
+    for (const win of floatWindows) {
+      if (!win.isDestroyed() && win.webContents === event.sender) { win.close(); break; }
+    }
+  });
+
+  // 全量配置备份与恢复
+  let pendingBackupRestore = null;
+  ipcMain.handle('dsh:backup-export', async (event, payload = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'unauthorized' };
+    try {
+      const label = payload && typeof payload.label === 'string' ? payload.label : '';
+      const home = effectiveDshHome() || path.join(os.homedir(), '.dsh');
+      const profileDir = path.join(home, 'profiles', 'web');
+      const backup = desktopBackup.createBackup({ profileDir, homeDir: home, label: String(label || '') }, fs, path);
+      const defaultName = 'dsh-desktop-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+      const chosen = await dialog.showSaveDialog(mainWindow, {
+        title: '导出 DSH 配置备份',
+        defaultPath: defaultName,
+        filters: [{ name: 'DSH 备份文件', extensions: ['json'] }],
+        properties: ['createDirectory', 'showOverwriteConfirmation'],
+      });
+      if (chosen.canceled || !chosen.filePath) return { ok: false, canceled: true };
+      const json = JSON.stringify(backup, null, 2) + '\n';
+      fs.writeFileSync(chosen.filePath, json, 'utf8');
+      log('backup', '已导出备份: ' + chosen.filePath + ' (' + backup.files.length + ' 文件)');
+      return {
+        ok: true,
+        file: chosen.filePath,
+        files: backup.files.length,
+        secretFiles: backup.secretFiles,
+        bytes: Buffer.byteLength(json),
+      };
+    } catch (err) {
+      log('backup', '导出备份失败: ' + ((err && err.message) || err));
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  ipcMain.handle('dsh:backup-restore', async (event, payload = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'unauthorized' };
+    try {
+      const preview = Boolean(payload && payload.preview === true);
+      const home = effectiveDshHome() || path.join(os.homedir(), '.dsh');
+      const profileDir = path.join(home, 'profiles', 'web');
+      let file;
+      if (preview) {
+        const chosen = await dialog.showOpenDialog(mainWindow, {
+          title: '选择要恢复的 DSH 备份文件',
+          filters: [{ name: 'DSH 备份文件', extensions: ['json'] }],
+          properties: ['openFile'],
+        });
+        if (chosen.canceled || !chosen.filePaths || chosen.filePaths.length === 0) return { ok: false, canceled: true };
+        file = chosen.filePaths[0];
+      } else {
+        const token = payload && typeof payload.token === 'string' ? payload.token : '';
+        const approved = pendingBackupRestore;
+        if (!approved || token !== approved.token || Date.now() > approved.expiresAt) {
+          pendingBackupRestore = null;
+          return { ok: false, error: '恢复确认已失效，请重新选择并预览备份文件' };
+        }
+        file = approved.file;
+      }
+      if (!fs.existsSync(file)) return { ok: false, error: '备份文件不存在' };
+      const raw = fs.readFileSync(file, 'utf8');
+      const parsed = JSON.parse(raw);
+      const backup = desktopBackup.validatedBackup(parsed);
+      if (preview) {
+        const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        pendingBackupRestore = { token, file, expiresAt: Date.now() + 10 * 60 * 1000 };
+        return {
+          ok: true,
+          preview: {
+            file,
+            token,
+            files: backup.files.length,
+            secretFiles: backup.secretFiles || [],
+            createdAt: backup.createdAt,
+            label: backup.label || '',
+          },
+        };
+      }
+      pendingBackupRestore = null;
+      const result = desktopBackup.restoreBackup(backup, { profileDir, homeDir: home }, fs, path);
+      log('backup', '已恢复备份 ' + file + '（' + result.files + ' 文件）');
+      return { ok: true, files: result.files, restartRequired: true };
+    } catch (err) {
+      log('backup', '恢复备份失败: ' + ((err && err.message) || err));
+      return { ok: false, error: String((err && err.message) || err) };
     }
   });
 }
