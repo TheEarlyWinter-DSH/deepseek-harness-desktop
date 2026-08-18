@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 // cordis.patch.yml profile patch management and row cleanup helpers.
 
 /** Serialize a config object as patch-row YAML lines (2-space step from `name:`). */
@@ -64,4 +67,130 @@ function removeBundledRowDuplicates(patch, rowIds, bundleNames) {
   return removePluginRows(patch, targets);
 }
 
-module.exports = { configLinesFor, removeBundledRowDuplicates, removePluginRows };
+/**
+ * Check whether a plugin package exists in profileDir/node_modules (or fallbackDir)
+ * and has a resolvable entrypoint module.
+ */
+function isPluginPackageValid(name, profileDir, fallbackDir) {
+  if (!name || typeof name !== 'string') return { ok: false, reason: 'invalid name' };
+  
+  const rel = name.split('/');
+  const dirs = [
+    path.join(profileDir, 'node_modules', ...rel),
+    fallbackDir ? path.join(fallbackDir, ...rel) : null,
+  ].filter(Boolean);
+
+  let pkgDir = null;
+  for (const d of dirs) {
+    try {
+      if (fs.existsSync(d) && (fs.statSync(d).isDirectory() || fs.lstatSync(d).isSymbolicLink())) {
+        pkgDir = d;
+        break;
+      }
+    } catch {}
+  }
+
+  if (!pkgDir) {
+    return { ok: false, reason: 'package directory not found' };
+  }
+
+  // Check package.json entry point
+  const pkgJsonPath = path.join(pkgDir, 'package.json');
+  let pkgJson = null;
+  try {
+    if (fs.existsSync(pkgJsonPath)) {
+      pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+    }
+  } catch {}
+
+  const candidates = [];
+  if (pkgJson) {
+    if (typeof pkgJson.main === 'string' && pkgJson.main) {
+      candidates.push(pkgJson.main);
+    }
+    if (pkgJson.exports && typeof pkgJson.exports === 'object') {
+      if (typeof pkgJson.exports['.'] === 'string') {
+        candidates.push(pkgJson.exports['.']);
+      } else if (pkgJson.exports['.']?.import) {
+        candidates.push(pkgJson.exports['.'].import);
+      } else if (pkgJson.exports['.']?.default) {
+        candidates.push(pkgJson.exports['.'].default);
+      }
+    }
+  }
+  // Default fallbacks
+  candidates.push('lib/index.js', 'index.js', 'lib/index.mjs', 'index.mjs', 'lib/index.cjs', 'index.cjs');
+
+  for (const cand of candidates) {
+    const file = path.resolve(pkgDir, cand);
+    try {
+      if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+        return { ok: true, entry: file };
+      }
+    } catch {}
+  }
+
+  return { ok: false, reason: 'entrypoint module not found' };
+}
+
+/**
+ * Scan cordis.patch.yml for active (non-disabled) plugin entries that are missing
+ * from node_modules or lack a valid entrypoint, and disable them to prevent boot crashes.
+ */
+function healBrokenPatchEntries(profileDir, patch, fallbackDir, log = () => {}) {
+  const disabled = [];
+  if (typeof patch !== 'string' || patch === '' || !profileDir) return { patch, disabled };
+
+  const lines = patch.split(/\r?\n/);
+  const out = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^-\s*insert:/.test(line)) {
+      let j = i + 1;
+      let id = '';
+      let name = '';
+      let isDisabled = false;
+
+      while (j < lines.length && !/^-\s*insert:/.test(lines[j]) && /^#/.test(lines[j]) === false && /^\s+\S/.test(lines[j])) {
+        const idMatch = /\bid:\s*([\w-]+)/.exec(lines[j]);
+        if (idMatch) id = idMatch[1];
+        const nameMatch = /\bname:\s*['"]?([^'"\s]+)['"]?/.exec(lines[j]);
+        if (nameMatch) name = nameMatch[1];
+        if (/\bdisabled:\s*true\b/.test(lines[j])) isDisabled = true;
+        j++;
+      }
+      const blockEnd = j;
+
+      if (id && name && !isDisabled) {
+        const check = isPluginPackageValid(name, profileDir, fallbackDir);
+        if (!check.ok) {
+          disabled.push({ id, name, reason: check.reason });
+          log(`已自愈损坏/缺失的插件: ${id} (${name}, 原因: ${check.reason})，自动标记为 disabled: true`);
+          
+          out.push(line);
+          for (let k = i + 1; k < blockEnd; k++) {
+            out.push(lines[k]);
+          }
+          out.push('      disabled: true');
+          i = blockEnd - 1;
+          continue;
+        }
+      }
+    }
+    out.push(line);
+  }
+
+  let text = out.join('\n').replace(/\n{3,}/g, '\n\n');
+  if (!text.endsWith('\n')) text += '\n';
+  return { patch: text, disabled };
+}
+
+module.exports = {
+  configLinesFor,
+  removeBundledRowDuplicates,
+  removePluginRows,
+  isPluginPackageValid,
+  healBrokenPatchEntries,
+};
+

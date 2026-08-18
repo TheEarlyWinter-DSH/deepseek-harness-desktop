@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const { configLinesFor, removeBundledRowDuplicates, removePluginRows } = require(join(root, 'patch-row-heal.js'));
+const { configLinesFor, removeBundledRowDuplicates, removePluginRows, isPluginPackageValid, healBrokenPatchEntries } = require(join(root, 'patch-row-heal.js'));
 
 const SAMPLE_PATCH = [
   '# dsh web profile patch（由 DSH Desktop 维护）',
@@ -92,3 +92,40 @@ test('removeBundledRowDuplicates: 非 uninstall 目标插件（tts 等）不受�
   const { removed } = removeBundledRowDuplicates(patch, rowIds, ['@dsh-external/dsh-plugin-tts']);
   assert.deepEqual(removed, []);
 });
+
+test('healBrokenPatchEntries: 自动将缺失入口文件的插件标记为 disabled: true', async () => {
+  const patch = [
+    '- insert:',
+    '    - id: good-plugin',
+    "      name: 'good-plugin'",
+    '- insert:',
+    '    - id: broken-plugin',
+    "      name: 'broken-plugin'",
+    '- insert:',
+    '    - id: already-disabled',
+    "      name: 'already-disabled'",
+    '      disabled: true',
+    '',
+  ].join('\n');
+
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const tmp = fs.mkdtempSync(join(os.tmpdir(), 'patch-heal-test-'));
+  const modulesDir = join(tmp, 'node_modules');
+  fs.mkdirSync(join(modulesDir, 'good-plugin', 'lib'), { recursive: true });
+  fs.writeFileSync(join(modulesDir, 'good-plugin', 'lib', 'index.js'), 'export default {}');
+  fs.writeFileSync(join(modulesDir, 'good-plugin', 'package.json'), JSON.stringify({ name: 'good-plugin', main: 'lib/index.js' }));
+
+  // broken-plugin has package.json with lib/index.js, but lib/index.js does NOT exist
+  fs.mkdirSync(join(modulesDir, 'broken-plugin'), { recursive: true });
+  fs.writeFileSync(join(modulesDir, 'broken-plugin', 'package.json'), JSON.stringify({ name: 'broken-plugin', main: 'lib/index.js' }));
+
+  const { patch: out, disabled } = healBrokenPatchEntries(tmp, patch, null);
+  assert.equal(disabled.length, 1);
+  assert.equal(disabled[0].id, 'broken-plugin');
+  assert.match(out, /- id: broken-plugin\s*\n\s*name: 'broken-plugin'\s*\n\s*disabled: true/);
+  assert.match(out, /- id: good-plugin\s*\n\s*name: 'good-plugin'\s*\n- insert:/);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
