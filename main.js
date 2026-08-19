@@ -1047,6 +1047,20 @@ function registerChromeIpc() {
     }
   });
 
+  // 图片粘贴（dsh-image-paste 插件）：把剪贴板图片存到临时目录
+  ipcMain.handle('dsh:image-paste-save', async (event, { dataUrl, name } = {}) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: 'unauthorized' };
+    try {
+      const res = imagePasteSave(String(dataUrl || ''), String(name || '粘贴图片'));
+      if (!res.ok) return res;
+      log('plugin', '已保存粘贴图片: ' + res.path);
+      return res;
+    } catch (err) {
+      log('plugin', '保存粘贴图片失败: ' + ((err && err.message) || err));
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
   // 账户余额与订阅额度监控
   ipcMain.handle('dsh:balance-refresh', async (event) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) return null;
@@ -1334,6 +1348,16 @@ const COMPANION_PLUGINS = [
   { id: 'mobile-fix', name: 'dsh-web-mobile-fix', dir: 'dsh-web-mobile-fix' },
   { id: 'interactive-cards', name: '@deepseek-ai/dsh-interactive-cards', dir: 'dsh-interactive-cards' },
   { id: 'skill-loader', name: '@deepseek-ai/dsh-skill-loader', dir: 'dsh-skill-loader' },
+  // ── 移植自社区插件 ──
+  { id: 'auto-compact', name: 'dsh-auto-compact', dir: 'dsh-auto-compact' },
+  { id: 'font-custom', name: 'dsh-font-custom', dir: 'dsh-font-custom' },
+  { id: 'side-session', name: '@dsh-external/dsh-side-session', dir: 'dsh-side-session' },
+  { id: 'message-rewind', name: 'dsh-message-rewind', dir: 'dsh-message-rewind' },
+  { id: 'dsh-undo', name: 'dsh-undo-savepoint', dir: 'dsh-undo-savepoint' },
+  { id: 'third-party-thinking', name: '@deepseek-ai/dsh-third-party-thinking' },
+  { id: 'file-drop', name: 'dsh-file-drop', dir: 'dsh-file-drop' },
+  { id: 'image-paste', name: 'dsh-image-paste', dir: 'dsh-image-paste' },
+  { id: 'dsh-navbar', name: '@vlln/dsh-navbar', dir: 'dsh-navbar' },
 ];
 
 // 皮肤包目录：assets/skins/<id>/。每个皮肤是一个完整的 dsh client 插件包
@@ -1372,7 +1396,7 @@ function copyPluginPackage(profileDirP, src, name) {
   for (const f of ['package.json', 'skin.json', ...EXTRA_PACKAGE_FILES]) copyFile(f);
   // 社区插件（soul-md / tdai-memory / tool-vision）入口在包根目录而非
   // lib/，vendor/ 是其内置依赖，同样必须随包分发。
-  for (const f of ['index.js', 'client.js', 'recall-inject.js', 'cordis.patch.yml']) copyFile(f);
+  for (const f of ['index.js', 'index.mjs', 'client.js', 'recall-inject.js', 'cordis.patch.yml']) copyFile(f);
   copyDir('lib');
   copyDir('preview');
   copyDir('vendor');
@@ -1827,6 +1851,38 @@ function startPreviewStaticServer() {
     log("boot", "预览静态服务已启动: http://127.0.0.1:" + previewStaticPort);
   });
   server.on("error", (err) => log("boot", "预览静态服务失败: " + err.message));
+}
+
+// 图片粘贴保存（dsh-image-paste 插件）：只接受 image/* 的 data URL。
+// base64 解码后原子写入 %TEMP%/dsh-paste/<清洗名>-<时间戳><ext>，返回
+// { ok, path, size }。文件在临时目录，随系统清理，不污染工作区。
+const IMAGE_PASTE_MAX_BYTES = 15 * 1024 * 1024;
+const IMAGE_PASTE_EXT = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/bmp': '.bmp',
+  'image/avif': '.avif',
+  'image/ico': '.ico',
+  'image/x-icon': '.ico',
+  'image/tiff': '.tiff',
+};
+
+function imagePasteSave(dataUrl, name) {
+  const m = /^data:(image\/[\w.+-]+);base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl);
+  if (!m) return { ok: false, error: '不是合法的图片 data URL' };
+  const mime = m[1].toLowerCase();
+  if (!IMAGE_PASTE_EXT[mime]) return { ok: false, error: '不支持的图片类型: ' + mime };
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length === 0) return { ok: false, error: '图片内容为空' };
+  if (buf.length > IMAGE_PASTE_MAX_BYTES) return { ok: false, error: '图片超过 15MB 上限' };
+  const dir = path.join(os.tmpdir(), 'dsh-paste');
+  fs.mkdirSync(dir, { recursive: true });
+  const base = String(name).replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim().slice(0, 40) || '粘贴图片';
+  const file = path.join(dir, base + '-' + Date.now() + IMAGE_PASTE_EXT[mime]);
+  fs.writeFileSync(file, buf);
+  return { ok: true, path: file, size: buf.length };
 }
 
 function boot() {

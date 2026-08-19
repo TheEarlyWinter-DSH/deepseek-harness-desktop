@@ -11,7 +11,7 @@
 //      "dsh-balance-changed" 事件，供 dsh-balance 插件消费。
 //   3. 把 Web UI 内容下移 36px（body padding-top），保证自绘栏不遮挡界面。
 
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const BAR_ID = '__dsh_desktop_chrome__';
 const BAR_HEIGHT = 36;
@@ -69,6 +69,15 @@ const dshDesktop = {
     check: () => ipcRenderer.invoke('dsh:client-update-check'),
     download: (rel) => ipcRenderer.invoke('dsh:client-update-download', { release: rel }),
     apply: (pending) => ipcRenderer.invoke('dsh:client-update-apply', { pending }),
+  },
+  // 图片粘贴（dsh-image-paste 插件）：把剪贴板图片存到临时目录
+  // （%TEMP%/dsh-paste/），返回 { ok, path, size } 供 agent 读取。
+  imagePaste: {
+    save: (payload) => ipcRenderer.invoke('dsh:image-paste-save', payload),
+  },
+  // 拖入文件（dsh-file-drop）：取浏览器 File 对象的完整磁盘路径
+  getPathForFile: (file) => {
+    try { return webUtils.getPathForFile(file) || ''; } catch { return ''; }
   },
   guard: {
     action: (action, value) => ipcRenderer.invoke('guard:action', { action, value }),

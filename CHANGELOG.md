@@ -3,6 +3,25 @@
 DeepSeek Harness（dsh）的零配置 Windows 桌面发行版：内置独立 Node 运行时、
 dsh CLI、桌面工作流与配套插件。
 
+## [2.6.0] — 2026-08-19
+
+### 新增功能（移植自社区配套插件）
+- **自动压缩（dsh-auto-compact）**：监听会话 contextPressure 投影，接近上下文上限（默认 80%，可调）时自动发送 /compact，长对话不再撑爆上下文。
+- **字体自定义（dsh-font-custom）**：设置页直接调整界面字体家族、字号与文字/代码颜色，实时预览、localStorage 持久化。
+- **临时会话（dsh-side-session）**：独立悬浮窗，自动导入当前主对话上下文，发起不污染主会话的临时追问。
+- **消息倒带（dsh-message-rewind）**：Trae 风格对话回退，编辑任意已发送消息并从该点重新生成。
+- **撤销保存点（dsh-undo-savepoint）**：配置文件变更时自动快照，支持从 Web UI 或聊天内撤销/回滚。
+- **第三方模型思考强度（dsh-third-party-thinking）**：为未声明推理能力的 OpenAI 兼容第三方模型注入 off/high/max 思考强度控件。
+- **文件拖放（dsh-file-drop）**：把本地文件直接拖入对话输入框，文本自动注入，图片/二进制文件注入路径提示。
+- **图片粘贴（dsh-image-paste）**：Ctrl/Cmd+V 粘贴剪贴板图片，自动保存到临时目录并注入路径提示。
+- **对话节点导航条（dsh-navbar）**：user 消息快速跳转导航条。
+
+### 桌面壳改进
+- 新增 `dsh:image-paste-save` IPC handler 和 `imagePasteSave` 函数，支持图片粘贴的受控文件保存。
+- preload 桥暴露 `imagePaste.save` 和 `getPathForFile` 方法。
+- 依赖新增 `schemastery`（为 dsh-side-session 提供设置校验）。
+- 插件复制逻辑支持 `index.mjs` 入口文件。
+
 ## [2.5.0] — 2026-08-18
 
 ### 新增功能
